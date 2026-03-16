@@ -148,6 +148,7 @@ public:
 	void set_cr(uint32 v)		{ cr().set(v); }
 	uint32 get_xer() const		{ return xer().get(); }
 	void set_xer(uint32 v)		{ xer().set(v); }
+	uint32 get_pc() const		{ return pc(); }
 
 	// Execute NATIVE_OP routine
 	void execute_native_op(uint32 native_op);
@@ -735,6 +736,39 @@ void FlushCodeCache(uintptr start, uintptr end)
 static void dump_registers(void)
 {
 	ppc_cpu->dump_registers();
+}
+
+// Dump PPC registers (externally callable, e.g. from signal handlers)
+void DumpPPCRegisters(void)
+{
+	if (ppc_cpu) {
+		fprintf(stderr, "=== PPC register dump (signal) ===\n");
+		ppc_cpu->dump_registers();
+		uint32 cur_pc = ppc_cpu->get_pc();
+		fprintf(stderr, "Instructions around PC %08x:\n", cur_pc);
+		for (int i = -4; i <= 8; i++) {
+			uint32 addr = cur_pc + i * 4;
+			uint32 opcode = vm_read_memory_4(addr);
+			fprintf(stderr, "  %s %08x: %08x\n", (i == 0) ? ">>" : "  ", addr, opcode);
+		}
+#if PPC_ENABLE_JIT
+		fprintf(stderr, "JIT: %s", PrefsFindBool("jit") ? "enabled" : "disabled");
+		if (PrefsFindBool("jit")) {
+			uint32 used = ppc_cpu->jit_cache_used();
+			uint32 total = ppc_cpu->jit_cache_total();
+			fprintf(stderr, "  cache=%u/%u bytes (%.1f%%)",
+				used, total, total ? 100.0 * used / total : 0.0);
+		}
+		fprintf(stderr, "\n");
+#endif
+#if PPC_FLIGHT_RECORDER
+		fprintf(stderr, "Flight recorder: dumping to ppc.log...\n");
+		ppc_cpu->dump_log("ppc.log");
+		fprintf(stderr, "Flight recorder: done\n");
+#endif
+		fprintf(stderr, "==================================\n");
+		fflush(stderr);
+	}
 }
 
 // Dump log

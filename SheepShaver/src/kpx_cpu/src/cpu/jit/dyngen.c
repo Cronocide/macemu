@@ -66,7 +66,12 @@
 #define HOST_M68K 1
 #elif defined(__mips__)
 #define HOST_MIPS 1
+#elif defined(__aarch64__)
+#define HOST_AARCH64 1
 #endif
+
+/* Verbose mode for inspecting dyngen output (enabled with -v) */
+static int dyngen_verbose = 0;
 
 /* Debug generated code */
 #if ENABLE_MON && (defined(HOST_I386) || defined(HOST_X86_64)) && 0
@@ -233,6 +238,42 @@ static int pretty_print(char *buf, uintptr_t addr, uintptr_t base)
 #define elf_check_arch(x) ((x) == EM_MIPS)
 #define ELF_USES_RELOCA
 #define ELF_USES_ALSO_RELOC
+
+#elif defined(HOST_AARCH64)
+
+#define ELF_CLASS	ELFCLASS64
+#ifndef EM_AARCH64
+#define EM_AARCH64	183
+#endif
+#define ELF_ARCH	EM_AARCH64
+#define elf_check_arch(x) ((x) == EM_AARCH64)
+#define ELF_USES_RELOCA
+
+/* AArch64 ELF relocation types */
+#ifndef R_AARCH64_ABS64
+#define R_AARCH64_ABS64			257
+#define R_AARCH64_ABS32			258
+#define R_AARCH64_ABS16			259
+#define R_AARCH64_PREL64		260
+#define R_AARCH64_PREL32		261
+#define R_AARCH64_PREL16		262
+#define R_AARCH64_MOVW_UABS_G0		263
+#define R_AARCH64_MOVW_UABS_G0_NC	264
+#define R_AARCH64_MOVW_UABS_G1		265
+#define R_AARCH64_MOVW_UABS_G1_NC	266
+#define R_AARCH64_MOVW_UABS_G2		267
+#define R_AARCH64_MOVW_UABS_G2_NC	268
+#define R_AARCH64_MOVW_UABS_G3		269
+#define R_AARCH64_ADR_PREL_PG_HI21	275
+#define R_AARCH64_ADD_ABS_LO12_NC	277
+#define R_AARCH64_LDST8_ABS_LO12_NC	278
+#define R_AARCH64_LDST16_ABS_LO12_NC	284
+#define R_AARCH64_LDST32_ABS_LO12_NC	285
+#define R_AARCH64_LDST64_ABS_LO12_NC	286
+#define R_AARCH64_LDST128_ABS_LO12_NC	299
+#define R_AARCH64_JUMP26		282
+#define R_AARCH64_CALL26		283
+#endif
 
 #else
 #error unsupported CPU - please update the code
@@ -1756,6 +1797,18 @@ void gen_code(const char *name, const char *demangled_name,
     size_t nd;
     char *demangled;
     int status;
+#ifdef HOST_AARCH64
+    int n_aarch64_lp_refs = 0;
+    int aarch64_lp_ref_adrp[128];
+    int aarch64_lp_ref_ldst[128];
+    int aarch64_lp_ref_eidx[128];
+    int n_aarch64_lp_entries = 0;
+    host_ulong aarch64_lp_entry_off[64];
+    int aarch64_lp_entry_shndx[64];
+    char aarch64_lp_entry_sym[64][256];
+    long aarch64_lp_entry_addend[64];
+    int aarch64_lp_entry_has_reloc[64];
+#endif
 
     if (strncmp(name, "op_execute", 10) == 0)
       op_execute = 1;
@@ -1944,11 +1997,261 @@ void gen_code(const char *name, const char *demangled_name,
             error("jr ra expected at the end of %s", name);
         copy_size = p - p_start;
     }
+#elif defined(HOST_AARCH64)
+    {
+        uint8_t *p;
+        p = (void *)(p_end - 4);
+        if (p == p_start)
+            error("empty code for %s", name);
+        /* Scan backwards for RET (0xd65f03c0) */
+        while (p > p_start && get32((uint32_t *)p) != 0xd65f03c0)
+            p -= 4;
+        if (get32((uint32_t *)p) != 0xd65f03c0)
+            error("ret expected at the end of %s", name);
+        /* Skip standard prologue if present:
+         *   stp x29, x30, [sp, #-N]!  (pre-indexed, any imm7)
+         *   mov x29, sp               (0x910003fd)
+         *   stp Xn, Xm, [sp, #imm]   (additional callee-saved reg pairs)
+         *
+         * Mask 0xffc07fff covers bits 31-22 (opcode) and 14-0
+         * (Rt2=x30, Rn=sp, Rt=x29), leaving imm7 (bits 21-15) free.
+         */
+        {
+            int prologue_skip = 0;
+            uint32_t insn = get32((uint32_t *)p_start);
+            if ((insn & 0xffc07fff) == 0xa9807bfd) {
+                /* STP x29, x30, [sp, #imm]! -- skip it */
+                p_start += 4;
+                start_offset += 4;
+                prologue_skip++;
+
+                insn = get32((uint32_t *)p_start);
+                if (insn == 0x910003fd) {
+                    /* MOV x29, sp -- skip it */
+                    p_start += 4;
+                    start_offset += 4;
+                    prologue_skip++;
+                    insn = get32((uint32_t *)p_start);
+                }
+
+                /* Skip additional stp Xn, Xm, [sp, #imm] (signed-offset
+                 * store pair, 64-bit GPR). Mask 0xffc003e0 checks opcode
+                 * bits 31-22 and Rn=sp bits 9-5. */
+                while (prologue_skip < 8 &&
+                       (uint8_t *)p_start < p &&
+                       (insn & 0xffc003e0) == 0xa90003e0) {
+                    p_start += 4;
+                    start_offset += 4;
+                    prologue_skip++;
+                    insn = get32((uint32_t *)p_start);
+                }
+            }
+        }
+
+        /* Strip epilogue and FORCE_RET.
+         * FORCE_RET() emits 'ret' as an end-of-op marker. Between it
+         * and the compiler's final RET, the compiler emits epilogue
+         * instructions (ldp pairs restoring callee-saved regs).
+         * Strip all of these so micro-ops fall through in the JIT buffer;
+         * actual returns use gen_exec_return() which emits a B instruction.
+         */
+        {
+            uint8_t *q = p; /* p points at compiler's RET */
+            int epi_count = 0;
+
+            while (q >= p_start + 4 && epi_count < 10) {
+                uint32_t ei = get32((uint32_t *)(q - 4));
+                int is_epi = 0;
+
+                /* LDP (load pair) from sp: signed-offset or post-indexed.
+                 * bits[29:27]=101, bit[22]=L=1, bits[9:5]=Rn=sp(31).
+                 * type bits[25:23]: 010=signed-offset, 001=post-indexed. */
+                if ((ei & 0x38400000) == 0x28400000 &&
+                    (ei & 0x000003e0) == 0x000003e0) {
+                    int type = (ei >> 23) & 7;
+                    if (type == 2 || type == 1)
+                        is_epi = 1;
+                }
+
+                /* MOV sp, x29 (= ADD sp, x29, #0) */
+                if (ei == 0x910003bf)
+                    is_epi = 1;
+
+                /* NOP (alignment padding) */
+                if (ei == 0xd503201f)
+                    is_epi = 1;
+
+                if (!is_epi)
+                    break;
+                q -= 4;
+                epi_count++;
+            }
+
+            /* Strip FORCE_RET 'ret' if present before the epilogue */
+            if (q >= p_start + 4 &&
+                get32((uint32_t *)(q - 4)) == 0xd65f03c0) {
+                q -= 4;
+            }
+
+            p = q;
+        }
+        copy_size = p - p_start;
+
+        /* Scan for ADRP+LDST64 literal pool references.
+         * GCC generates literal pools after the ret instruction for loading
+         * 64-bit constants (like addresses of globals). Since dyngen only
+         * copies the code body up to ret, these literal pools are lost.
+         * We collect them here and append them to the JIT buffer later. */
+        if (!op_execute) {
+            int ri;
+            ELF_RELOC *rel2;
+            for (ri = 0, rel2 = relocs; ri < nb_relocs; ri++, rel2++) {
+                host_ulong roff = rel2->r_offset;
+                int rtype;
+                int rsym_idx;
+                if (roff < start_offset || roff >= start_offset + (host_ulong)copy_size)
+                    continue;
+                rtype = ELFW(R_TYPE)(rel2->r_info);
+                if (rtype != R_AARCH64_ADR_PREL_PG_HI21)
+                    continue;
+                rsym_idx = ELFW(R_SYM)(rel2->r_info);
+                if (strtab[symtab[rsym_idx].st_name] != '\0')
+                    continue;
+                /* Section-relative ADRP found - literal pool reference */
+                {
+                    host_ulong target = symtab[rsym_idx].st_value + rel2->r_addend;
+                    host_ulong ldst_roff = 0;
+                    int rj, eidx, found_ldst, found_abs;
+                    ELF_RELOC *rel3;
+
+                    /* Find paired LDST64 within 4 instructions of the ADRP.
+                     * GCC may insert other instructions between ADRP and LDR. */
+                    found_ldst = 0;
+                    for (rj = 0, rel3 = relocs; rj < nb_relocs; rj++, rel3++) {
+                        if (rel3->r_offset > roff &&
+                            rel3->r_offset <= roff + 16 &&
+                            ELFW(R_TYPE)(rel3->r_info) == R_AARCH64_LDST64_ABS_LO12_NC) {
+                            found_ldst = 1;
+                            ldst_roff = rel3->r_offset;
+                            break;
+                        }
+                    }
+                    if (!found_ldst)
+                        continue;
+
+                    /* Find or create unique literal pool entry */
+                    eidx = -1;
+                    for (rj = 0; rj < n_aarch64_lp_entries; rj++) {
+                        if (aarch64_lp_entry_off[rj] == target) {
+                            eidx = rj;
+                            break;
+                        }
+                    }
+                    if (eidx < 0) {
+                        if (n_aarch64_lp_entries >= 64)
+                            error("too many literal pool entries in %s", name);
+                        eidx = n_aarch64_lp_entries++;
+                        aarch64_lp_entry_off[eidx] = target;
+                        aarch64_lp_entry_shndx[eidx] = symtab[rsym_idx].st_shndx;
+                        aarch64_lp_entry_has_reloc[eidx] = 0;
+                        aarch64_lp_entry_addend[eidx] = 0;
+                        aarch64_lp_entry_sym[eidx][0] = '\0';
+
+                        /* Find ABS64 relocation at the literal pool entry.
+                         * The entry may reside in .text or .rodata, so search
+                         * the relocation section that belongs to the entry's
+                         * actual section rather than assuming .text relocs. */
+                        {
+                            ELF_RELOC *lp_relocs;
+                            int nb_lp_relocs;
+                            int lp_shndx = aarch64_lp_entry_shndx[eidx];
+
+                            if (lp_shndx == text_shndx) {
+                                lp_relocs = relocs;
+                                nb_lp_relocs = nb_relocs;
+                            } else {
+                                int ri_sec = find_reloc(lp_shndx);
+                                if (ri_sec) {
+                                    lp_relocs = (ELF_RELOC *)sdata[ri_sec];
+                                    nb_lp_relocs = shdr[ri_sec].sh_size / shdr[ri_sec].sh_entsize;
+                                } else {
+                                    lp_relocs = NULL;
+                                    nb_lp_relocs = 0;
+                                }
+                            }
+
+                            found_abs = 0;
+                            for (rj = 0, rel3 = lp_relocs; rj < nb_lp_relocs; rj++, rel3++) {
+                                if (rel3->r_offset == target &&
+                                    ELFW(R_TYPE)(rel3->r_info) == R_AARCH64_ABS64) {
+                                    const char *abs_sym = strtab + symtab[ELFW(R_SYM)(rel3->r_info)].st_name;
+                                    strncpy(aarch64_lp_entry_sym[eidx], abs_sym, 255);
+                                    aarch64_lp_entry_sym[eidx][255] = '\0';
+                                    aarch64_lp_entry_addend[eidx] = rel3->r_addend;
+                                    aarch64_lp_entry_has_reloc[eidx] = 1;
+                                    found_abs = 1;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!found_abs) {
+                            aarch64_lp_entry_has_reloc[eidx] = 0;
+                        }
+                    }
+
+                    if (n_aarch64_lp_refs >= 128)
+                        error("too many literal pool references in %s", name);
+                    aarch64_lp_ref_adrp[n_aarch64_lp_refs] = (int)(roff - start_offset);
+                    aarch64_lp_ref_ldst[n_aarch64_lp_refs] = (int)(ldst_roff - start_offset);
+                    aarch64_lp_ref_eidx[n_aarch64_lp_refs] = eidx;
+                    n_aarch64_lp_refs++;
+                }
+            }
+        }
+    }
 #else
 #error unsupported CPU
 #endif
 
-    
+    /* Verbose: dump op info to stderr for build-time inspection */
+    if (dyngen_verbose) {
+        int ri2, reloc_count = 0;
+        ELF_RELOC *vrel;
+        for (ri2 = 0, vrel = relocs; ri2 < nb_relocs; ri2++, vrel++) {
+            host_ulong voff = get_rel_offset(vrel);
+            if (voff >= start_offset && voff < start_offset + copy_size)
+                reloc_count++;
+        }
+        fprintf(stderr, "[dyngen] %s: code_size=%d relocs=%d",
+                name, copy_size, reloc_count);
+#ifdef HOST_AARCH64
+        fprintf(stderr, " lp_refs=%d lp_entries=%d",
+                n_aarch64_lp_refs, n_aarch64_lp_entries);
+#endif
+        fprintf(stderr, "\n");
+        if (dyngen_verbose >= 2) {
+            int vi;
+            fprintf(stderr, "  code: ");
+            for (vi = 0; vi < copy_size && vi < 128; vi++) {
+                fprintf(stderr, "%02x", p_start[vi]);
+                if ((vi & 3) == 3) fprintf(stderr, " ");
+            }
+            if (copy_size > 128)
+                fprintf(stderr, "... (%d more bytes)", copy_size - 128);
+            fprintf(stderr, "\n");
+#ifdef HOST_AARCH64
+            for (vi = 0; vi < n_aarch64_lp_entries; vi++) {
+                fprintf(stderr, "  lpool[%d]: off=0x%lx shndx=%d%s sym=%s addend=%ld has_reloc=%d\n",
+                        vi, (unsigned long)aarch64_lp_entry_off[vi],
+                        aarch64_lp_entry_shndx[vi],
+                        aarch64_lp_entry_shndx[vi] != text_shndx ? " (!text)" : "",
+                        aarch64_lp_entry_sym[vi][0] ? aarch64_lp_entry_sym[vi] : "(raw)",
+                        aarch64_lp_entry_addend[vi],
+                        aarch64_lp_entry_has_reloc[vi]);
+            }
+#endif
+        }
+    }
 
     /* compute the number of arguments by looking at the relocations */
     for(i = 0;i < MAX_ARGS; i++)
@@ -2093,7 +2396,94 @@ void gen_code(const char *name, const char *demangled_name,
 
         /* patch relocations */
         patch_relocations(outfile, name, size, start_offset, copy_size);
-        fprintf(outfile, "    inc_code_ptr(%d);\n", copy_size);
+
+#ifdef HOST_AARCH64
+        if (n_aarch64_lp_refs > 0) {
+            int lj;
+            int n_lp_entries = n_aarch64_lp_entries;
+
+            fprintf(outfile, "    /* AArch64 literal pool: %d refs -> %d entries */\n",
+                    n_aarch64_lp_refs, n_lp_entries);
+
+            /*
+             * Literal pool alignment must be computed at RUNTIME because
+             * code_ptr() is not known at dyngen time. LDST64 requires the
+             * target address to be 8-byte aligned; the lo12 encoding
+             * drops the low 3 bits, silently rounding down to the wrong
+             * address if the pool is misaligned.
+             *
+             * Layout emitted at runtime:
+             *   code_ptr() + copy_size
+             *   [optional NOP for alignment]
+             *   B instruction (skip over pool)
+             *   LP entry 0 (8 bytes, 8-byte aligned)
+             *   LP entry 1 (8 bytes)
+             *   ...
+             */
+            fprintf(outfile, "    {\n");
+            fprintf(outfile, "        int _lp_pad = ((unsigned long)(code_ptr() + %d + 4) & 7) ? 4 : 0;\n",
+                    copy_size);
+            fprintf(outfile, "        int _lp_branch = %d + _lp_pad;\n", copy_size);
+            fprintf(outfile, "        int _lp_data = _lp_branch + 4;\n");
+            fprintf(outfile, "        int _lp_total = _lp_data + %d;\n", n_lp_entries * 8);
+
+            /* Emit NOP padding if needed */
+            fprintf(outfile, "        if (_lp_pad)\n");
+            fprintf(outfile, "            *(uint32_t *)(code_ptr() + %d) = 0xd503201f;\n",
+                    copy_size);
+
+            /* Emit B instruction to skip over literal pool data */
+            fprintf(outfile, "        *(uint32_t *)(code_ptr() + _lp_branch) = 0x14000000 | ((_lp_total - _lp_branch) / 4);\n");
+
+            /* Write literal pool entries with runtime symbol addresses */
+            for (lj = 0; lj < n_lp_entries; lj++) {
+                if (aarch64_lp_entry_has_reloc[lj]) {
+                    fprintf(outfile, "        { extern char %s[]; *(uint64_t *)(code_ptr() + _lp_data + %d) = (uint64_t)(&%s) + %ldL; }\n",
+                            aarch64_lp_entry_sym[lj], lj * 8,
+                            aarch64_lp_entry_sym[lj], aarch64_lp_entry_addend[lj]);
+                } else {
+                    uint8_t *lp_sec_data = sdata[aarch64_lp_entry_shndx[lj]];
+                    if (!lp_sec_data)
+                        error("literal pool entry in %s references section %d with no data",
+                              name, aarch64_lp_entry_shndx[lj]);
+                    uint64_t raw_val = *(uint64_t *)(lp_sec_data + aarch64_lp_entry_off[lj]);
+                    fprintf(outfile, "        *(uint64_t *)(code_ptr() + _lp_data + %d) = 0x%llxULL;\n",
+                            lj * 8, (unsigned long long)raw_val);
+                }
+            }
+
+            /* Patch each ADRP+LDST64 pair to reference literal pool in JIT buffer */
+            for (lj = 0; lj < n_aarch64_lp_refs; lj++) {
+                int adrp_off = aarch64_lp_ref_adrp[lj];
+                int ldst_off = aarch64_lp_ref_ldst[lj];
+                int eidx = aarch64_lp_ref_eidx[lj];
+
+                /* Patch ADRP: set page-relative offset to literal pool entry */
+                fprintf(outfile, "        {\n");
+                fprintf(outfile, "            uint32_t *_p = (uint32_t *)(code_ptr() + %d);\n", adrp_off);
+                fprintf(outfile, "            long _page = ((long)(code_ptr() + _lp_data + %d) & ~0xfffL)\n", eidx * 8);
+                fprintf(outfile, "                        - ((long)_p & ~0xfffL);\n");
+                fprintf(outfile, "            long _imm = _page >> 12;\n");
+                fprintf(outfile, "            *_p = (*_p & ~0x60ffffe0)\n");
+                fprintf(outfile, "                | ((_imm & 0x3) << 29)\n");
+                fprintf(outfile, "                | (((_imm >> 2) & 0x7ffff) << 5);\n");
+                fprintf(outfile, "        }\n");
+
+                /* Patch LDST64: set lo12 offset to literal pool entry */
+                fprintf(outfile, "        {\n");
+                fprintf(outfile, "            uint32_t *_p = (uint32_t *)(code_ptr() + %d);\n", ldst_off);
+                fprintf(outfile, "            uint64_t _val = (uint64_t)(code_ptr() + _lp_data + %d);\n", eidx * 8);
+                fprintf(outfile, "            *_p = (*_p & ~(0xfff << 10)) | (((_val & 0xfff) >> 3) << 10);\n");
+                fprintf(outfile, "        }\n");
+            }
+
+            fprintf(outfile, "        inc_code_ptr(_lp_total);\n");
+            fprintf(outfile, "    }\n");
+        } else
+#endif
+        {
+            fprintf(outfile, "    inc_code_ptr(%d);\n", copy_size);
+        }
         fprintf(outfile, "}\n");
         fprintf(outfile, "#endif\n");
         fprintf(outfile, "\n");
@@ -2874,6 +3264,179 @@ void patch_relocations(FILE *outfile, const char *name, host_ulong size, host_ul
 			}
 		}
 	}
+#elif defined(HOST_AARCH64)
+	{
+	char final_sym_name[256];
+	const char *sym_name, *p;
+	int type;
+	long addend;
+	for (i = 0, rel = relocs; i < nb_relocs; i++, rel++) {
+		if (rel->r_offset >= start_offset &&
+			rel->r_offset < start_offset + (host_ulong)copy_size) {
+			sym_name = strtab + symtab[ELFW(R_SYM)(rel->r_info)].st_name;
+			if (sym_name[0] == '\0')
+				continue;
+			if (is_op_jmp(sym_name, &p)) {
+				int n;
+				n = strtol(p, NULL, 10);
+				fprintf(outfile, "    jmp_addr[%d] = code_ptr() + %d;\n",
+					n, (int)(rel->r_offset - start_offset));
+				continue;
+			}
+
+			get_reloc_expr(final_sym_name, sizeof(final_sym_name), sym_name);
+			type = ELFW(R_TYPE)(rel->r_info);
+			addend = rel->r_addend;
+			switch (type) {
+			case R_AARCH64_ABS64:
+				fprintf(outfile, "    /* R_AARCH64_ABS64 reloc, offset 0x%x */\n",
+					(unsigned)(rel->r_offset));
+				fprintf(outfile, "    *(uint64_t *)(code_ptr() + %d) = (uint64_t)%s + %ld;\n",
+					(int)(rel->r_offset - start_offset), final_sym_name, addend);
+				break;
+			case R_AARCH64_ABS32:
+				fprintf(outfile, "    /* R_AARCH64_ABS32 reloc, offset 0x%x */\n",
+					(unsigned)(rel->r_offset));
+				fprintf(outfile, "    *(uint32_t *)(code_ptr() + %d) = (uint32_t)((uint64_t)%s + %ld);\n",
+					(int)(rel->r_offset - start_offset), final_sym_name, addend);
+				break;
+			case R_AARCH64_MOVW_UABS_G0:
+			case R_AARCH64_MOVW_UABS_G0_NC:
+				fprintf(outfile, "    /* R_AARCH64_MOVW_UABS_G0 reloc, offset 0x%x */\n",
+					(unsigned)(rel->r_offset));
+				fprintf(outfile, "    {\n");
+				fprintf(outfile, "        uint32_t *_p = (uint32_t *)(code_ptr() + %d);\n",
+					(int)(rel->r_offset - start_offset));
+				fprintf(outfile, "        uint64_t _val = (uint64_t)%s + %ld;\n", final_sym_name, addend);
+				fprintf(outfile, "        *_p = (*_p & ~(0xffff << 5)) | (((_val >> 0) & 0xffff) << 5);\n");
+				fprintf(outfile, "    }\n");
+				break;
+			case R_AARCH64_MOVW_UABS_G1:
+			case R_AARCH64_MOVW_UABS_G1_NC:
+				fprintf(outfile, "    /* R_AARCH64_MOVW_UABS_G1 reloc, offset 0x%x */\n",
+					(unsigned)(rel->r_offset));
+				fprintf(outfile, "    {\n");
+				fprintf(outfile, "        uint32_t *_p = (uint32_t *)(code_ptr() + %d);\n",
+					(int)(rel->r_offset - start_offset));
+				fprintf(outfile, "        uint64_t _val = (uint64_t)%s + %ld;\n", final_sym_name, addend);
+				fprintf(outfile, "        *_p = (*_p & ~(0xffff << 5)) | (((_val >> 16) & 0xffff) << 5);\n");
+				fprintf(outfile, "    }\n");
+				break;
+			case R_AARCH64_MOVW_UABS_G2:
+			case R_AARCH64_MOVW_UABS_G2_NC:
+				fprintf(outfile, "    /* R_AARCH64_MOVW_UABS_G2 reloc, offset 0x%x */\n",
+					(unsigned)(rel->r_offset));
+				fprintf(outfile, "    {\n");
+				fprintf(outfile, "        uint32_t *_p = (uint32_t *)(code_ptr() + %d);\n",
+					(int)(rel->r_offset - start_offset));
+				fprintf(outfile, "        uint64_t _val = (uint64_t)%s + %ld;\n", final_sym_name, addend);
+				fprintf(outfile, "        *_p = (*_p & ~(0xffff << 5)) | (((_val >> 32) & 0xffff) << 5);\n");
+				fprintf(outfile, "    }\n");
+				break;
+			case R_AARCH64_MOVW_UABS_G3:
+				fprintf(outfile, "    /* R_AARCH64_MOVW_UABS_G3 reloc, offset 0x%x */\n",
+					(unsigned)(rel->r_offset));
+				fprintf(outfile, "    {\n");
+				fprintf(outfile, "        uint32_t *_p = (uint32_t *)(code_ptr() + %d);\n",
+					(int)(rel->r_offset - start_offset));
+				fprintf(outfile, "        uint64_t _val = (uint64_t)%s + %ld;\n", final_sym_name, addend);
+				fprintf(outfile, "        *_p = (*_p & ~(0xffff << 5)) | (((_val >> 48) & 0xffff) << 5);\n");
+				fprintf(outfile, "    }\n");
+				break;
+			case R_AARCH64_JUMP26:
+			case R_AARCH64_CALL26:
+				fprintf(outfile, "    /* R_AARCH64_%s26 reloc, offset 0x%x */\n",
+					type == R_AARCH64_CALL26 ? "CALL" : "JUMP",
+					(unsigned)(rel->r_offset));
+				fprintf(outfile, "    {\n");
+				fprintf(outfile, "        uint32_t *_p = (uint32_t *)(code_ptr() + %d);\n",
+					(int)(rel->r_offset - start_offset));
+				fprintf(outfile, "        long _off = (long)((uint8_t *)%s + %ld - (uint8_t *)_p) >> 2;\n",
+					final_sym_name, addend);
+				fprintf(outfile, "        *_p = (*_p & ~0x03ffffff) | (_off & 0x03ffffff);\n");
+				fprintf(outfile, "    }\n");
+				break;
+			case R_AARCH64_ADR_PREL_PG_HI21:
+				fprintf(outfile, "    /* R_AARCH64_ADR_PREL_PG_HI21 reloc, offset 0x%x */\n",
+					(unsigned)(rel->r_offset));
+				fprintf(outfile, "    {\n");
+				fprintf(outfile, "        uint32_t *_p = (uint32_t *)(code_ptr() + %d);\n",
+					(int)(rel->r_offset - start_offset));
+				fprintf(outfile, "        long _page = ((long)((uint8_t *)%s + %ld) & ~0xfff)\n",
+					final_sym_name, addend);
+				fprintf(outfile, "                    - ((long)_p & ~0xfff);\n");
+				fprintf(outfile, "        long _imm = _page >> 12;\n");
+				fprintf(outfile, "        *_p = (*_p & ~0x60ffffe0)\n");
+				fprintf(outfile, "            | ((_imm & 0x3) << 29)\n");
+				fprintf(outfile, "            | (((_imm >> 2) & 0x7ffff) << 5);\n");
+				fprintf(outfile, "    }\n");
+				break;
+			case R_AARCH64_ADD_ABS_LO12_NC:
+				fprintf(outfile, "    /* R_AARCH64_ADD_ABS_LO12_NC reloc, offset 0x%x */\n",
+					(unsigned)(rel->r_offset));
+				fprintf(outfile, "    {\n");
+				fprintf(outfile, "        uint32_t *_p = (uint32_t *)(code_ptr() + %d);\n",
+					(int)(rel->r_offset - start_offset));
+				fprintf(outfile, "        uint64_t _val = (uint64_t)%s + %ld;\n", final_sym_name, addend);
+				fprintf(outfile, "        *_p = (*_p & ~(0xfff << 10)) | ((_val & 0xfff) << 10);\n");
+				fprintf(outfile, "    }\n");
+				break;
+			case R_AARCH64_LDST8_ABS_LO12_NC:
+				fprintf(outfile, "    /* R_AARCH64_LDST8_ABS_LO12_NC reloc, offset 0x%x */\n",
+					(unsigned)(rel->r_offset));
+				fprintf(outfile, "    {\n");
+				fprintf(outfile, "        uint32_t *_p = (uint32_t *)(code_ptr() + %d);\n",
+					(int)(rel->r_offset - start_offset));
+				fprintf(outfile, "        uint64_t _val = (uint64_t)%s + %ld;\n", final_sym_name, addend);
+				fprintf(outfile, "        *_p = (*_p & ~(0xfff << 10)) | ((_val & 0xfff) << 10);\n");
+				fprintf(outfile, "    }\n");
+				break;
+			case R_AARCH64_LDST16_ABS_LO12_NC:
+				fprintf(outfile, "    /* R_AARCH64_LDST16_ABS_LO12_NC reloc, offset 0x%x */\n",
+					(unsigned)(rel->r_offset));
+				fprintf(outfile, "    {\n");
+				fprintf(outfile, "        uint32_t *_p = (uint32_t *)(code_ptr() + %d);\n",
+					(int)(rel->r_offset - start_offset));
+				fprintf(outfile, "        uint64_t _val = (uint64_t)%s + %ld;\n", final_sym_name, addend);
+				fprintf(outfile, "        *_p = (*_p & ~(0xfff << 10)) | (((_val & 0xfff) >> 1) << 10);\n");
+				fprintf(outfile, "    }\n");
+				break;
+			case R_AARCH64_LDST32_ABS_LO12_NC:
+				fprintf(outfile, "    /* R_AARCH64_LDST32_ABS_LO12_NC reloc, offset 0x%x */\n",
+					(unsigned)(rel->r_offset));
+				fprintf(outfile, "    {\n");
+				fprintf(outfile, "        uint32_t *_p = (uint32_t *)(code_ptr() + %d);\n",
+					(int)(rel->r_offset - start_offset));
+				fprintf(outfile, "        uint64_t _val = (uint64_t)%s + %ld;\n", final_sym_name, addend);
+				fprintf(outfile, "        *_p = (*_p & ~(0xfff << 10)) | (((_val & 0xfff) >> 2) << 10);\n");
+				fprintf(outfile, "    }\n");
+				break;
+			case R_AARCH64_LDST64_ABS_LO12_NC:
+				fprintf(outfile, "    /* R_AARCH64_LDST64_ABS_LO12_NC reloc, offset 0x%x */\n",
+					(unsigned)(rel->r_offset));
+				fprintf(outfile, "    {\n");
+				fprintf(outfile, "        uint32_t *_p = (uint32_t *)(code_ptr() + %d);\n",
+					(int)(rel->r_offset - start_offset));
+				fprintf(outfile, "        uint64_t _val = (uint64_t)%s + %ld;\n", final_sym_name, addend);
+				fprintf(outfile, "        *_p = (*_p & ~(0xfff << 10)) | (((_val & 0xfff) >> 3) << 10);\n");
+				fprintf(outfile, "    }\n");
+				break;
+			case R_AARCH64_LDST128_ABS_LO12_NC:
+				fprintf(outfile, "    /* R_AARCH64_LDST128_ABS_LO12_NC reloc, offset 0x%x */\n",
+					(unsigned)(rel->r_offset));
+				fprintf(outfile, "    {\n");
+				fprintf(outfile, "        uint32_t *_p = (uint32_t *)(code_ptr() + %d);\n",
+					(int)(rel->r_offset - start_offset));
+				fprintf(outfile, "        uint64_t _val = (uint64_t)%s + %ld;\n", final_sym_name, addend);
+				fprintf(outfile, "        *_p = (*_p & ~(0xfff << 10)) | (((_val & 0xfff) >> 4) << 10);\n");
+				fprintf(outfile, "    }\n");
+				break;
+			default:
+				error("unsupported aarch64 relocation (%d)", type);
+			}
+		}
+	}
+	}
 #else
 #error unsupported CPU
 #endif
@@ -2980,8 +3543,9 @@ int gen_file(FILE *outfile, int out_type)
 void usage(void)
 {
     printf("dyngen (c) 2003-2004 Fabrice Bellard\n"
-           "usage: dyngen [-o outfile] objfile\n"
+           "usage: dyngen [-o outfile] [-v] objfile\n"
            "Generate a dynamic code generator from an object file\n"
+           "  -v  verbose: dump op sizes and relocations (-vv for code bytes)\n"
            );
     exit(1);
 }
@@ -2995,12 +3559,15 @@ int main(int argc, char **argv)
     outfilename = "out.c";
     out_type = OUT_GEN_OP_ALL;
     for(;;) {
-        c = getopt(argc, argv, "ho:");
+        c = getopt(argc, argv, "hvo:");
         if (c == -1)
             break;
         switch(c) {
         case 'h':
             usage();
+            break;
+        case 'v':
+            dyngen_verbose++;
             break;
         case 'o':
             outfilename = optarg;

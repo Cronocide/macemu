@@ -335,6 +335,8 @@ protected:
 	bool use_jit;
 public:
 	void enable_jit(uint32 cache_size = 0);
+	uint32 jit_cache_used() const { return codegen.get_cache_used(); }
+	uint32 jit_cache_total() const { return codegen.get_cache_size(); }
 #endif
 
 private:

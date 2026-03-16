@@ -38,6 +38,13 @@ static inline void dg_set_jmp_target_noflush(uint8 *jmp_addr, uint8 *addr)
 	// patch the branch destination
 	*(uint32 *)jmp_addr = addr - (jmp_addr + 4);
 #endif
+#if defined(__aarch64__)
+	uint32 *ptr = (uint32 *)jmp_addr;
+	uint32 val = *ptr;
+	intptr_t offset = (addr - jmp_addr) >> 2;
+	val = (val & ~0x03ffffff) | (offset & 0x03ffffff);
+	*ptr = val;
+#endif
 }
 
 static inline void dg_set_jmp_target(uint8 *jmp_addr, uint8 *addr)
@@ -50,6 +57,13 @@ static inline void dg_set_jmp_target(uint8 *jmp_addr, uint8 *addr)
     asm volatile ("icbi 0,%0" : : "r"(ptr) : "memory");
     asm volatile ("sync" : : : "memory");
     asm volatile ("isync" : : : "memory");
+#endif
+#if defined(__aarch64__)
+	asm volatile ("dc cvau, %0" :: "r"(jmp_addr) : "memory");
+	asm volatile ("dsb ish" ::: "memory");
+	asm volatile ("ic ivau, %0" :: "r"(jmp_addr) : "memory");
+	asm volatile ("dsb ish" ::: "memory");
+	asm volatile ("isb" ::: "memory");
 #endif
 }
 
@@ -253,6 +267,11 @@ basic_dyngen::direct_jump_possible(uintptr target) const
 	const intptr offset = (intptr)target - (intptr)code_ptr() - sizeof(void *);
 	return offset <= 0xffffffff;
 #endif
+#if defined(__aarch64__)
+	/* B instruction: +/- 128MB range */
+	const intptr offset = (intptr)target - (intptr)code_ptr();
+	return (offset >= -(1 << 27)) && (offset < (1 << 27));
+#endif
 	return false;
 }
 
@@ -294,6 +313,11 @@ basic_dyngen::direct_call_possible(uintptr target) const
 #if defined(__x86_64__)
 	const intptr offset = (intptr)target - (intptr)code_ptr() - sizeof(void *);
 	return offset <= 0xffffffff;
+#endif
+#if defined(__aarch64__)
+	/* BL instruction: +/- 128MB range */
+	const intptr offset = (intptr)target - (intptr)code_ptr();
+	return (offset >= -(1 << 27)) && (offset < (1 << 27));
 #endif
 	return false;
 }
@@ -370,5 +394,10 @@ DEFINE_OP(load,T0,s8);
 DEFINE_OP(store,T0,8);
 
 #undef DEFINE_OP
+
+#include "cpu/ppc/ppc-config.hpp"
+#if PPC_AARCH64_JIT_DEBUG >= 2
+extern void dump_jit_block(const uint8 *start, int size, uint32 ppc_pc);
+#endif
 
 #endif /* BASIC_DYNGEN_H */

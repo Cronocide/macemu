@@ -149,3 +149,13 @@ bool cpuinfo_check_altivec(void)
 {
 	return ppc_cpu_features & HWCAP_PPC_ALTIVEC;
 }
+
+// Check for AArch64 feature NEON (Advanced SIMD)
+bool cpuinfo_check_neon(void)
+{
+#if defined(__aarch64__)
+	return true;
+#else
+	return false;
+#endif
+}

@@ -50,20 +50,50 @@
 #define DEBUG 0
 #include "debug.h"
 
+#if defined(__GNUC__) && defined(__aarch64__)
+#define PPC_HOT __attribute__((hot, flatten))
+#else
+#define PPC_HOT
+#endif
+
 /**
  *	Illegal & NOP instructions
  **/
 
 void powerpc_cpu::execute_illegal(uint32 opcode)
 {
-	fprintf(stderr, "Illegal instruction at %08x, opcode = %08x\n", pc(), opcode);
+	static int illegal_count = 0;
+	illegal_count++;
 
 #ifdef SHEEPSHAVER
 	if (PrefsFindBool("ignoreillegal")) {
+		if (illegal_count <= 5) {
+			fprintf(stderr, "Illegal instruction at %08x, opcode = %08x (ignored)\n", pc(), opcode);
+			fflush(stderr);
+		}
 		increment_pc(4);
 		return;
 	}
 #endif
+
+	if (illegal_count <= 5) {
+		fprintf(stderr, "Illegal instruction at %08x, opcode = %08x\n", pc(), opcode);
+		fprintf(stderr, "  LR=%08x CTR=%08x CR=%08x XER=%08x\n",
+			lr(), ctr(), cr().get(), xer().get());
+		fprintf(stderr, "  GPR:");
+		for (int i = 0; i < 32; i++) {
+			if (i % 8 == 0) fprintf(stderr, "\n    r%-2d:", i);
+			fprintf(stderr, " %08x", gpr(i));
+		}
+		fprintf(stderr, "\n");
+		fflush(stderr);
+	}
+
+	if (illegal_count >= 10) {
+		fprintf(stderr, "Too many illegal instructions (%d), aborting.\n", illegal_count);
+		fflush(stderr);
+		abort();
+	}
 
 #if ENABLE_MON
 	disass_ppc(stdout, pc(), opcode);
@@ -152,7 +182,7 @@ struct op_overflow<op_add> {
  **/
 
 template< class RA, class RB, class RC, class CA, class OE, class Rc >
-void powerpc_cpu::execute_addition(uint32 opcode)
+PPC_HOT void powerpc_cpu::execute_addition(uint32 opcode)
 {
 	const uint32 a = RA::get(this, opcode);
 	const uint32 b = RB::get(this, opcode);
@@ -190,7 +220,7 @@ void powerpc_cpu::execute_addition(uint32 opcode)
  **/
 
 template< class OP, class RD, class RA, class RB, class RC, class OE, class Rc >
-void powerpc_cpu::execute_generic_arith(uint32 opcode)
+PPC_HOT void powerpc_cpu::execute_generic_arith(uint32 opcode)
 {
 	const uint32 a = RA::get(this, opcode);
 	const uint32 b = RB::get(this, opcode);
@@ -221,7 +251,7 @@ void powerpc_cpu::execute_generic_arith(uint32 opcode)
  **/
 
 template< class SH, class MA, class Rc >
-void powerpc_cpu::execute_rlwimi(uint32 opcode)
+PPC_HOT void powerpc_cpu::execute_rlwimi(uint32 opcode)
 {
 	const uint32 n = SH::get(this, opcode);
 	const uint32 m = MA::get(this, opcode);
@@ -266,7 +296,7 @@ struct invalid_shift<op_shra> {
 };
 
 template< class OP, class RD, class RA, class SH, class SO, class CA, class Rc >
-void powerpc_cpu::execute_shift(uint32 opcode)
+PPC_HOT void powerpc_cpu::execute_shift(uint32 opcode)
 {
 	const uint32 n = SO::apply(SH::get(this, opcode));
 	const uint32 r = RA::get(this, opcode);
@@ -307,7 +337,7 @@ void powerpc_cpu::execute_shift(uint32 opcode)
  **/
 
 template< class PC, class BO, class DP, class AA, class LK >
-void powerpc_cpu::execute_branch(uint32 opcode)
+PPC_HOT void powerpc_cpu::execute_branch(uint32 opcode)
 {
 	const int bo = BO::get(this, opcode);
 	bool ctr_ok = true;
@@ -343,7 +373,7 @@ void powerpc_cpu::execute_branch(uint32 opcode)
  **/
 
 template< class RB, typename CT >
-void powerpc_cpu::execute_compare(uint32 opcode)
+PPC_HOT void powerpc_cpu::execute_compare(uint32 opcode)
 {
 	const uint32 a = operand_RA::get(this, opcode);
 	const uint32 b = RB::get(this, opcode);
@@ -412,7 +442,7 @@ void powerpc_cpu::execute_divide(uint32 opcode)
  **/
 
 template< bool HI, bool SB, class OE, class Rc >
-void powerpc_cpu::execute_multiply(uint32 opcode)
+PPC_HOT void powerpc_cpu::execute_multiply(uint32 opcode)
 {
 	const uint32 a = operand_RA::get(this, opcode);
 	const uint32 b = operand_RB::get(this, opcode);
@@ -566,7 +596,7 @@ DEFINE_MEMORY_HELPER(2);
 DEFINE_MEMORY_HELPER(4);
 
 template< class OP, class RA, class RB, bool LD, int SZ, bool UP, bool RX >
-void powerpc_cpu::execute_loadstore(uint32 opcode)
+PPC_HOT void powerpc_cpu::execute_loadstore(uint32 opcode)
 {
 	const uint32 a = RA::get(this, opcode);
 	const uint32 b = RB::get(this, opcode);
@@ -584,7 +614,7 @@ void powerpc_cpu::execute_loadstore(uint32 opcode)
 }
 
 template< class RA, class DP, bool LD >
-void powerpc_cpu::execute_loadstore_multiple(uint32 opcode)
+PPC_HOT void powerpc_cpu::execute_loadstore_multiple(uint32 opcode)
 {
 	const uint32 a = RA::get(this, opcode);
 	const uint32 d = DP::get(this, opcode);
@@ -625,7 +655,7 @@ void powerpc_cpu::execute_loadstore_multiple(uint32 opcode)
  **/
 
 template< class RA, class RB, bool LD, bool DB, bool UP >
-void powerpc_cpu::execute_fp_loadstore(uint32 opcode)
+PPC_HOT void powerpc_cpu::execute_fp_loadstore(uint32 opcode)
 {
 	const uint32 a = RA::get(this, opcode);
 	const uint32 b = RB::get(this, opcode);

@@ -64,6 +64,18 @@ int register_info_compare(const void *e1, const void *e2)
 
 static int ppc_refcount = 0;
 
+#if PPC_AARCH64_JIT_DEBUG
+struct jit_chain_record { uint32 src_pc; uint32 dst_pc; int slot; };
+static const int JIT_CHAIN_RING_SIZE = 64;
+static jit_chain_record jit_chain_ring[JIT_CHAIN_RING_SIZE];
+static int jit_chain_ring_idx = 0;
+
+struct jit_dispatch_record { uint32 entry_pc; uint32 return_pc; };
+static const int JIT_DISPATCH_RING_SIZE = 64;
+static jit_dispatch_record jit_dispatch_ring[JIT_DISPATCH_RING_SIZE];
+static int jit_dispatch_ring_idx = 0;
+#endif
+
 #ifdef DO_CONVENTION_CALL_STATICS
 template<> bool nv_mem_fun1_t<void, powerpc_cpu, uint32>::do_convention_call_init_done = false;
 template<> int nv_mem_fun1_t<void, powerpc_cpu, uint32>::do_convention_call_code_len = 0;
@@ -508,6 +520,21 @@ void powerpc_registers::interrupt_copy(powerpc_registers &oregs, powerpc_registe
 
 bool powerpc_cpu::check_spcflags()
 {
+#if PPC_AARCH64_JIT_DEBUG
+	static unsigned long spc_check_count = 0;
+	spc_check_count++;
+	if (spc_check_count <= 30 || (PPC_AARCH64_JIT_DEBUG >= 2 && (spc_check_count & 0xffff) == 0)) {
+		fprintf(stderr, "[JIT:spc] count=%lu flags=0x%08x", spc_check_count, spcflags().get());
+		if (spcflags().test(SPCFLAG_CPU_EXEC_RETURN)) fprintf(stderr, " EXEC_RETURN");
+		if (spcflags().test(SPCFLAG_JIT_EXEC_RETURN)) fprintf(stderr, " JIT_EXEC_RETURN");
+#ifdef SHEEPSHAVER
+		if (spcflags().test(SPCFLAG_CPU_HANDLE_INTERRUPT)) fprintf(stderr, " HANDLE_IRQ");
+		if (spcflags().test(SPCFLAG_CPU_TRIGGER_INTERRUPT)) fprintf(stderr, " TRIGGER_IRQ");
+#endif
+		if (spcflags().test(SPCFLAG_CPU_ENTER_MON)) fprintf(stderr, " ENTER_MON");
+		fprintf(stderr, "\n");
+	}
+#endif
 	if (spcflags().test(SPCFLAG_CPU_EXEC_RETURN)) {
 		spcflags().clear(SPCFLAG_CPU_EXEC_RETURN);
 		return false;
@@ -523,6 +550,14 @@ bool powerpc_cpu::check_spcflags()
 			HandleInterrupt(&r);
 			powerpc_registers::interrupt_copy(regs(), r);
 			processing_interrupt = false;
+			// On slow CPUs (e.g. Cortex-A53), HandleInterrupt may take
+			// longer than one timer period (~16.7ms at 60Hz). If the
+			// timer fired during HandleInterrupt, TRIGGER is already set
+			// again. Without this clear, TRIGGER→HANDLE conversion below
+			// keeps spcflags permanently non-zero, preventing JIT blocks
+			// from ever executing. The timer will re-trigger on the next
+			// tick, giving the JIT time to run between interrupts.
+			spcflags().clear(SPCFLAG_CPU_TRIGGER_INTERRUPT);
 		}
 	}
 	if (spcflags().test(SPCFLAG_CPU_TRIGGER_INTERRUPT)) {
@@ -563,15 +598,33 @@ void * PF_CONVENTION powerpc_cpu::compile_chain_block(block_info *sbi)
 
 	const uint32 tpc = sbi->li[n].jmp_pc;
 	block_info *tbi = my_block_cache.find(tpc);
-	if (tbi == NULL)
+	if (tbi == NULL) {
 		tbi = compile_block(tpc);
+#if PPC_AARCH64_JIT_DEBUG
+		fprintf(stderr, "[JIT:chain-comp] src=0x%08lx dst=0x%08x (new block compiled)\n",
+			(unsigned long)sbi->pc, tpc);
+#endif
+	}
 	assert(tbi && tbi->pc == tpc);
 
+#if PPC_AARCH64_JIT_DEBUG
+	static unsigned long chain_count = 0;
+	chain_count++;
+	if (chain_count <= 50 || (chain_count & 0xffff) == 0) {
+		fprintf(stderr, "[JIT:chain] #%lu src=0x%08lx dst=0x%08x slot=%d jmp_addr=%p entry=%p\n",
+			chain_count, (unsigned long)sbi->pc, tpc, n, sbi->li[n].jmp_addr, tbi->entry_point);
+	}
+	jit_chain_ring[jit_chain_ring_idx] = { (uint32)sbi->pc, tpc, n };
+	jit_chain_ring_idx = (jit_chain_ring_idx + 1) % JIT_CHAIN_RING_SIZE;
+#endif
 	dg_set_jmp_target(sbi->li[n].jmp_addr, tbi->entry_point);
 	return tbi->entry_point;
 }
 #endif
 
+#if defined(__GNUC__) && defined(__aarch64__)
+__attribute__((hot))
+#endif
 void powerpc_cpu::execute(uint32 entry)
 {
 	bool invalidated_cache = false;
@@ -584,15 +637,161 @@ void powerpc_cpu::execute(uint32 entry)
 	if (execute_depth == 1 || (PPC_ENABLE_JIT && PPC_REENTRANT_JIT)) {
 #if PPC_ENABLE_JIT
 		if (use_jit) {
+#if PPC_AARCH64_JIT_DEBUG
+			static unsigned long jit_dispatch_count = 0;
+			static unsigned long jit_compile_count = 0;
+			static unsigned long jit_cache_miss_count = 0;
+			static unsigned long jit_spcflag_exit_count = 0;
+			static unsigned long jit_cache_invalidate_count = 0;
+#endif
 			block_info *bi = my_block_cache.find(pc());
 			if (bi == NULL)
 				bi = compile_block(pc());
 			for (;;) {
 				// Execute all cached blocks
 				for (;;) {
+#if PPC_AARCH64_JIT_DEBUG
+					jit_dispatch_count++;
+#endif
+					uint32 pre_exec_pc = bi->pc;
+					uint32 pre_r31 = gpr(31);
+					uint32 pre_ctr = ctr();
+					uint32 pre_lr = lr();
 					codegen.execute(bi->entry_point);
+					uint32 post_exec_pc = pc();
+#if PPC_AARCH64_JIT_DEBUG
+					jit_dispatch_ring[jit_dispatch_ring_idx] = { pre_exec_pc, post_exec_pc };
+
+					if (pre_exec_pc == 0x5046e1dc) {
+						fprintf(stderr, "[JIT:BLR-DBG] block 0x%08x -> pc=0x%08x lr=0x%08x->0x%08x ctr=0x%08x->0x%08x\n",
+							pre_exec_pc, post_exec_pc, pre_lr, lr(), pre_ctr, ctr());
+						fprintf(stderr, "[JIT:BLR-DBG] CTR host addr=%p, CPU state starts at %p\n",
+							&regs().ctr, (void*)this);
+					} else if (pre_exec_pc >= 0x5046e180 && pre_exec_pc <= 0x5046e200) {
+						fprintf(stderr, "[JIT:BLR-DBG] block 0x%08x -> pc=0x%08x lr=0x%08x ctr=0x%08x\n",
+							pre_exec_pc, post_exec_pc, lr(), ctr());
+					}
+
+					{
+						uint32 post_r31 = gpr(31);
+						if (post_r31 >= 0x6A000000 && pre_r31 < 0x6A000000) {
+							fprintf(stderr, "[JIT:GPR31] r31 corrupted! dispatch #%lu: "
+								"pc=0x%08x->0x%08x r31: 0x%08x->0x%08x\n",
+								jit_dispatch_count, pre_exec_pc, post_exec_pc,
+								pre_r31, post_r31);
+							fprintf(stderr, "[JIT:GPR31] block end_pc=0x%08x size=%u entry=%p\n",
+								bi->end_pc, bi->size, bi->entry_point);
+							fprintf(stderr, "[JIT:GPR31] All GPRs:\n");
+							dump_registers();
+							fprintf(stderr, "[JIT:GPR31] PPC at block (0x%08x to 0x%08x):\n",
+								pre_exec_pc, bi->end_pc + 32);
+							for (uint32 addr = pre_exec_pc; addr <= bi->end_pc + 32 && addr < 0x60000000; addr += 4)
+								fprintf(stderr, "  0x%08x: 0x%08x%s\n", addr, vm_read_memory_4(addr),
+									addr == pre_exec_pc ? " <-- entry" : addr == bi->end_pc ? " <-- end" : "");
+							fflush(stderr);
+						}
+					}
+					jit_dispatch_ring_idx = (jit_dispatch_ring_idx + 1) % JIT_DISPATCH_RING_SIZE;
+
+					{
+						static bool kd_entry_logged = false;
+						if (!kd_entry_logged && post_exec_pc >= 0x68ffe000 && post_exec_pc < 0x6A000000) {
+							kd_entry_logged = true;
+							fprintf(stderr, "\n[JIT:KD-ENTRY] First jump to kernel data area!\n");
+							fprintf(stderr, "[JIT:KD-ENTRY] dispatch #%lu: pc=0x%08x->0x%08x\n",
+								jit_dispatch_count, pre_exec_pc, post_exec_pc);
+							fprintf(stderr, "[JIT:KD-ENTRY] GPRs:\n");
+							dump_registers();
+						fprintf(stderr, "[JIT:KD-ENTRY] Key kernel data offsets:\n");
+						fprintf(stderr, "  KD+0x1074 (opcode table)  = 0x%08x\n", vm_read_memory_4(0x68ffe000 + 0x1074));
+						fprintf(stderr, "  KD+0x1078 (emulator addr) = 0x%08x\n", vm_read_memory_4(0x68ffe000 + 0x1078));
+						fprintf(stderr, "  KD+0x0634 (emulator data) = 0x%08x\n", vm_read_memory_4(0x68ffe000 + 0x0634));
+						fprintf(stderr, "  KD+0x119c (opcode table2) = 0x%08x\n", vm_read_memory_4(0x68ffe000 + 0x119c));
+						fprintf(stderr, "  KD+0x1184 (emul init)     = 0x%08x\n", vm_read_memory_4(0x68ffe000 + 0x1184));
+						fprintf(stderr, "[JIT:KD-ENTRY] EmulatorData dump (KD+0x1000 to KD+0x10FF) via KERNEL_DATA_BASE:\n");
+						for (uint32 off = 0x1000; off < 0x1100; off += 16) {
+							fprintf(stderr, "  +0x%04x:", off);
+							for (int j = 0; j < 16; j += 4)
+								fprintf(stderr, " %08x", vm_read_memory_4(0x68ffe000 + off + j));
+							fprintf(stderr, "\n");
+						}
+						fprintf(stderr, "[JIT:KD-ENTRY] Same range via KERNEL_DATA2_BASE (0x5fffe000):\n");
+						for (uint32 off = 0x1000; off < 0x1100; off += 16) {
+							fprintf(stderr, "  +0x%04x:", off);
+							for (int j = 0; j < 16; j += 4)
+								fprintf(stderr, " %08x", vm_read_memory_4(0x5fffe000 + off + j));
+							fprintf(stderr, "\n");
+						}
+						fprintf(stderr, "[JIT:KD-ENTRY] Host addr check: vm_get_real(0x68fff038)=%p vm_get_real(0x5ffff038)=%p\n",
+							vm_do_get_real_address(0x68fff038), vm_do_get_real_address(0x5ffff038));
+							fprintf(stderr, "[JIT:KD-ENTRY] PPC instructions at source block (0x%08x):\n", pre_exec_pc);
+							for (uint32 a = (pre_exec_pc > 128 ? pre_exec_pc - 128 : 0); a < pre_exec_pc + 512 && a < 0x60000000; a += 4)
+								fprintf(stderr, "  0x%08x: 0x%08x%s\n", a, vm_read_memory_4(a),
+									a == pre_exec_pc ? " <-- entry" : "");
+							fprintf(stderr, "[JIT:KD-ENTRY] Last 8 dispatches:\n");
+							for (int i = JIT_DISPATCH_RING_SIZE - 8; i < JIT_DISPATCH_RING_SIZE; i++) {
+								int idx = (jit_dispatch_ring_idx + i) % JIT_DISPATCH_RING_SIZE;
+								fprintf(stderr, "  0x%08x -> 0x%08x\n",
+									jit_dispatch_ring[idx].entry_pc, jit_dispatch_ring[idx].return_pc);
+							}
+							fflush(stderr);
+						}
+					}
+
+					if (post_exec_pc >= 0x6A000000) {
+						fprintf(stderr, "\n[JIT:CORRUPT] PC out of range after JIT return!\n");
+						fprintf(stderr, "[JIT:CORRUPT] dispatch #%lu: entered at pc=0x%08x, returned pc=0x%08x\n",
+							jit_dispatch_count, pre_exec_pc, post_exec_pc);
+						fprintf(stderr, "[JIT:CORRUPT] block entry_point=%p bi->end_pc=0x%08x bi->size=%u\n",
+							bi->entry_point, bi->end_pc, bi->size);
+						fprintf(stderr, "[JIT:CORRUPT] Register dump:\n");
+						dump_registers();
+						fprintf(stderr, "\n[JIT:CORRUPT] Last %d dispatches (entry_pc -> return_pc):\n", JIT_DISPATCH_RING_SIZE);
+						for (int i = 0; i < JIT_DISPATCH_RING_SIZE; i++) {
+							int idx = (jit_dispatch_ring_idx + i) % JIT_DISPATCH_RING_SIZE;
+							if (jit_dispatch_ring[idx].entry_pc == 0 && jit_dispatch_ring[idx].return_pc == 0)
+								continue;
+							fprintf(stderr, "  [%2d] 0x%08x -> 0x%08x\n",
+								i, jit_dispatch_ring[idx].entry_pc, jit_dispatch_ring[idx].return_pc);
+						}
+						fprintf(stderr, "\n[JIT:CORRUPT] Last %d chain patches (src_pc -> dst_pc [slot]):\n", JIT_CHAIN_RING_SIZE);
+						for (int i = 0; i < JIT_CHAIN_RING_SIZE; i++) {
+							int idx = (jit_chain_ring_idx + i) % JIT_CHAIN_RING_SIZE;
+							if (jit_chain_ring[idx].src_pc == 0 && jit_chain_ring[idx].dst_pc == 0)
+								continue;
+							fprintf(stderr, "  [%2d] 0x%08x -> 0x%08x [%d]\n",
+								i, jit_chain_ring[idx].src_pc, jit_chain_ring[idx].dst_pc, jit_chain_ring[idx].slot);
+						}
+						fprintf(stderr, "\n[JIT:CORRUPT] PPC instructions at and around entry block (0x%08x, end_pc=0x%08x):\n",
+							pre_exec_pc, bi->end_pc);
+						uint32 dump_start = pre_exec_pc;
+						uint32 dump_end = bi->end_pc + 128;
+						if (dump_end < dump_start) dump_end = 0x5FFFFFFF;
+						for (uint32 addr = dump_start; addr <= dump_end && addr < 0x60000000; addr += 4) {
+							uint32 insn = vm_read_memory_4(addr);
+							const char *marker = "";
+							if (addr == pre_exec_pc) marker = " <-- entry";
+							else if (addr == bi->end_pc) marker = " <-- end_pc";
+							fprintf(stderr, "  0x%08x: 0x%08x%s\n", addr, insn, marker);
+						}
+						fprintf(stderr, "\n[JIT:CORRUPT] Previous dispatch return PCs (last 8):\n");
+						for (int i = JIT_DISPATCH_RING_SIZE - 8; i < JIT_DISPATCH_RING_SIZE; i++) {
+							int idx = (jit_dispatch_ring_idx + i) % JIT_DISPATCH_RING_SIZE;
+							fprintf(stderr, "  0x%08x -> 0x%08x\n",
+								jit_dispatch_ring[idx].entry_pc, jit_dispatch_ring[idx].return_pc);
+						}
+						fprintf(stderr, "\n[JIT:CORRUPT] stats: dispatches=%lu compiles=%lu misses=%lu spc_exits=%lu invalidates=%lu\n",
+							jit_dispatch_count, jit_compile_count, jit_cache_miss_count,
+							jit_spcflag_exit_count, jit_cache_invalidate_count);
+						fflush(stderr);
+						abort();
+					}
+#endif
 
 					if (!spcflags().empty()) {
+#if PPC_AARCH64_JIT_DEBUG
+						jit_spcflag_exit_count++;
+#endif
 						if (!check_spcflags())
 							goto return_site;
 
@@ -600,6 +799,11 @@ void powerpc_cpu::execute(uint32 entry)
 						if (spcflags().test(SPCFLAG_JIT_EXEC_RETURN)) {
 							spcflags().clear(SPCFLAG_JIT_EXEC_RETURN);
 							invalidated_cache = true;
+#if PPC_AARCH64_JIT_DEBUG
+							jit_cache_invalidate_count++;
+							fprintf(stderr, "[JIT:inv]  cache invalidated, recompile at pc=0x%08x (total=%lu)\n",
+								pc(), jit_cache_invalidate_count);
+#endif
 							break;
 						}
 					}
@@ -607,11 +811,22 @@ void powerpc_cpu::execute(uint32 entry)
 					// Don't check for backward branches here as this
 					// is now done by generated code. Besides, we will
 					// get here if the fast cache lookup failed too.
-					if ((bi = my_block_cache.find(pc())) == NULL)
+					if ((bi = my_block_cache.find(pc())) == NULL) {
+#if PPC_AARCH64_JIT_DEBUG
+						jit_cache_miss_count++;
+						if (jit_cache_miss_count <= 50 || (jit_cache_miss_count & 0xffff) == 0) {
+							fprintf(stderr, "[JIT:miss] #%lu pc=0x%08x\n",
+								jit_cache_miss_count, pc());
+						}
+#endif
 						break;
+					}
 				}
 
 				// Compile new block
+#if PPC_AARCH64_JIT_DEBUG
+				jit_compile_count++;
+#endif
 				bi = compile_block(pc());
 			}
 		}

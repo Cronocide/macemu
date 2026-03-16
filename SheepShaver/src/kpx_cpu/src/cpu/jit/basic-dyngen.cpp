@@ -95,11 +95,23 @@ DEFINE_INVOKE(CPU_A0_ret_A0, (void *(*func)(dyngen_cpu_base)), (funcptr));
 uint8 *
 basic_dyngen::gen_align(int align)
 {
-	int nbytes = align - (((uintptr)code_ptr()) % align);
-	if (nbytes == 0)
+	int remainder = ((uintptr)code_ptr()) % align;
+	if (remainder == 0)
 		return code_ptr();
+	int nbytes = align - remainder;
 
-#if defined(__i386__) || defined(__x86_64__)
+#if defined(__aarch64__)
+	/* AArch64 NOP: 0xd503201f. Align on 4-byte boundaries since all
+	 * instructions are 4 bytes. Pad with NOP instructions. */
+	if (nbytes % 4 != 0)
+		nbytes += 4 - (nbytes % 4);
+	{
+		static const uint8 aarch64_nop[] = { 0x1f, 0x20, 0x03, 0xd5 };
+		int nops = nbytes / 4;
+		for (int i = 0; i < nops; i++)
+			emit_block(aarch64_nop, 4);
+	}
+#elif defined(__i386__) || defined(__x86_64__)
 #if defined(__x86_64__)
 	static const uint8 prefixes[4] = { 0x66, 0x66, 0x66, 0x66 };
 	/* The recommended way to pad 64bit code is to use NOPs preceded by
@@ -184,5 +196,41 @@ basic_dyngen::gen_align(int align)
 #endif
 	return code_ptr();
 }
+
+#include "cpu/ppc/ppc-config.hpp"
+#if PPC_AARCH64_JIT_DEBUG >= 2
+void dump_jit_block(const uint8 *start, int size, uint32 ppc_pc)
+{
+	fprintf(stderr, "[JIT:dump] ppc_pc=0x%08x native=%p size=%d bytes\n", ppc_pc, start, size);
+	for (int i = 0; i < size; i += 4) {
+		if (i + 4 <= size) {
+			uint32 insn = *(const uint32 *)(start + i);
+			fprintf(stderr, "  +%04x: %08x", i, insn);
+			/* Annotate some common AArch64 instructions */
+			if (insn == 0xd65f03c0)
+				fprintf(stderr, "  ; ret");
+			else if (insn == 0xd503201f)
+				fprintf(stderr, "  ; nop");
+			else if ((insn & 0xfc000000) == 0x14000000)
+				fprintf(stderr, "  ; b +%d", (int)((insn & 0x03ffffff) << 2));
+			else if ((insn & 0xfc000000) == 0x94000000)
+				fprintf(stderr, "  ; bl +%d", (int)((insn & 0x03ffffff) << 2));
+			else if ((insn & 0x9f000000) == 0x90000000)
+				fprintf(stderr, "  ; adrp");
+			else if ((insn & 0xffe00000) == 0xd2800000)
+				fprintf(stderr, "  ; movz");
+			else if ((insn & 0xffe00000) == 0xf2800000)
+				fprintf(stderr, "  ; movk");
+			fprintf(stderr, "\n");
+		} else {
+			fprintf(stderr, "  +%04x: ", i);
+			for (int j = i; j < size; j++)
+				fprintf(stderr, "%02x", start[j]);
+			fprintf(stderr, " (partial)\n");
+		}
+	}
+	fflush(stderr);
+}
+#endif
 
 #endif //ENABLE_DYNGEN

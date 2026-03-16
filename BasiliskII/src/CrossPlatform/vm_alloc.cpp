@@ -84,7 +84,7 @@ typedef unsigned long vm_uintptr_t;
 #define MAP_ANONYMOUS 0
 #endif
 #ifdef MEM_BULK
-#define MAP_EXTRA_FLAGS 0
+#define MAP_EXTRA_FLAGS MAP_NORESERVE
 #else
 #define MAP_EXTRA_FLAGS (MAP_32BIT)
 #endif
@@ -217,7 +217,7 @@ int vm_init(void)
 #endif
 
 #ifdef MEM_BULK
-	VMBaseDiff = (vm_uintptr_t)vm_acquire_internal(0x60000000, VM_MAP_DEFAULT);
+	VMBaseDiff = (vm_uintptr_t)vm_acquire_internal(0x6A000000, VM_MAP_DEFAULT);
 	mapAddr = 0;
 #endif
 	return 0;

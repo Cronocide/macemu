@@ -33,6 +33,8 @@
 const int JIT_CACHE_SIZE = 2 * 1024;
 #elif defined(__powerpc__) || defined(__ppc__)
 const int JIT_CACHE_SIZE = 4 * 1024;
+#elif defined(__aarch64__)
+const int JIT_CACHE_SIZE = 4 * 1024;
 #else
 const int JIT_CACHE_SIZE = 8 * 1024;
 #endif
@@ -67,7 +69,11 @@ basic_jit_cache::init_translation_cache(uint32 size)
 	cache_size = (size + JIT_CACHE_SIZE_GUARD + roundup - 1) & -roundup;
 	assert(cache_size > 0);
 
+#if defined(__aarch64__)
+	tcode_start = (uint8 *)vm_acquire(cache_size, VM_MAP_PRIVATE);
+#else
 	tcode_start = (uint8 *)vm_acquire(cache_size, VM_MAP_PRIVATE | VM_MAP_32BIT);
+#endif
 	if (tcode_start == VM_MAP_FAILED) {
 		tcode_start = NULL;
 		return false;
@@ -129,7 +135,11 @@ basic_jit_cache::copy_data(const uint8 *block, uint32 size)
 		to_alloc = (to_alloc + page_size - 1) & -page_size;
 
 		D(bug("basic_jit_cache: Allocate data pool (%d KB)\n", to_alloc / 1024));
+#if defined(__aarch64__)
+		ptr = (uint8 *)vm_acquire(to_alloc, VM_MAP_PRIVATE);
+#else
 		ptr = (uint8 *)vm_acquire(to_alloc, VM_MAP_PRIVATE | VM_MAP_32BIT);
+#endif
 		if (ptr == VM_MAP_FAILED) {
 			fprintf(stderr, "FATAL: Could not allocate data pool!\n");
 			abort();

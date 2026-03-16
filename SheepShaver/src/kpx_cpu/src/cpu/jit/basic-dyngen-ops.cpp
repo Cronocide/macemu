@@ -33,6 +33,9 @@ register uint32  T##REG asm(REG_T##REG)
 DYNGEN_DEFINE_GLOBAL_REGISTER(0);
 DYNGEN_DEFINE_GLOBAL_REGISTER(1);
 DYNGEN_DEFINE_GLOBAL_REGISTER(2);
+#ifdef REG_T3
+DYNGEN_DEFINE_GLOBAL_REGISTER(3);
+#endif
 
 
 /**
@@ -49,10 +52,10 @@ DYNGEN_DEFINE_GLOBAL_REGISTER(2);
 #define do_sdiv_32(x, y)		((int32)x / (int32)y)
 #endif
 #ifndef do_rol_32
-#define do_rol_32(x, y)			((x << y) | (x >> (32 - y)))
+#define do_rol_32(x, y)			((x << ((y) & 31)) | (x >> ((32 - (y)) & 31)))
 #endif
 #ifndef do_ror_32
-#define do_ror_32(x, y)			((x >> y) | (x << (32 - y)))
+#define do_ror_32(x, y)			((x >> ((y) & 31)) | (x << ((32 - (y)) & 31)))
 #endif
 #ifndef do_xchg_32
 #define do_xchg_32(x, y)		do { uint32 t = x; x = y; y = t; } while (0)
@@ -63,9 +66,15 @@ DYNGEN_DEFINE_GLOBAL_REGISTER(2);
  *		ALU operations
  **/
 
-// XXX update for new 64-bit arches
 #if defined __x86_64__
 #define MOV_AD_REG(PARAM, REG) asm volatile ("movabsq $__op_" #PARAM ",%0" : "=r" (REG))
+#elif defined __aarch64__
+#define MOV_AD_REG(PARAM, REG) asm volatile ( \
+	"movz %0, #:abs_g3:__op_" #PARAM "\n\t" \
+	"movk %0, #:abs_g2_nc:__op_" #PARAM "\n\t" \
+	"movk %0, #:abs_g1_nc:__op_" #PARAM "\n\t" \
+	"movk %0, #:abs_g0_nc:__op_" #PARAM \
+	: "=r" (REG))
 #else
 #define MOV_AD_REG(PARAM, REG) REG = PARAM
 #endif
@@ -141,8 +150,8 @@ DEFINE_OP(bswap_32_T0, T0 = bswap_32(T0));
 
 // Logical operations
 DEFINE_OP(neg_32_T0, T0 = -T0);
-DEFINE_OP(not_32_T0, T0 = !T0);
-DEFINE_OP(not_32_T1, T1 = !T1);
+DEFINE_OP(not_32_T0, T0 = ~T0);
+DEFINE_OP(not_32_T1, T1 = ~T1);
 DEFINE_OP(and_32_T0_T1, T0 &= T1);
 DEFINE_OP(and_32_T0_im, T0 &= PARAM1);
 DEFINE_OP(or_32_T0_T1, T0 |= T1);
@@ -242,6 +251,9 @@ DEFINE_OP(8,T0,1,T2);
 #ifdef __arm__
 #define FORCE_RET() asm volatile ("b exec_loop")
 #endif
+#ifdef __aarch64__
+#define FORCE_RET() asm volatile ("ret")
+#endif
 #ifdef __mc68000
 #define FORCE_RET() asm volatile ("rts")
 #endif
@@ -257,6 +269,9 @@ void OPPROTO op_execute(uint8 *entry_point, basic_cpu *this_cpu)
 	stk[n_slots - 2] = A0;
 	stk[n_slots - 3] = A1;
 	stk[n_slots - 4] = A2;
+#ifdef REG_T3
+	stk[n_slots - 5] = A3;
+#endif
 	CPU = this_cpu;
 	DYNGEN_SLOW_DISPATCH(entry_point);
 	func(); // NOTE: never called, fake to make compiler save return point
@@ -270,6 +285,9 @@ void OPPROTO op_execute(uint8 *entry_point, basic_cpu *this_cpu)
 	asm volatile (ASM_SIZE(op_exec_return_offset));
 	asm volatile (ASM_PREVIOUS_SECTION);
 	asm volatile ("1:");
+#endif
+#ifdef REG_T3
+	A3 = stk[n_slots - 5];
 #endif
 	A2 = stk[n_slots - 4];
 	A1 = stk[n_slots - 3];
@@ -311,7 +329,7 @@ void OPPROTO impl_##NAME(void)									\
 }																\
 extern void OPPROTO NAME(void) __attribute__((weak_import));	\
 asm(".set  helper_" #NAME "," #NAME);
-#elif defined(__powerpc__) || ((defined(__x86_64__) || defined(__i386__)) && !defined(_WIN32))
+#elif defined(__powerpc__) || defined(__aarch64__) || ((defined(__x86_64__) || defined(__i386__)) && !defined(_WIN32))
 // XXX there is a problem on Windows: coff_text_shndx != text_shndx
 // The latter is found by searching for ".text" in all symbols and
 // assigning its e_scnum.

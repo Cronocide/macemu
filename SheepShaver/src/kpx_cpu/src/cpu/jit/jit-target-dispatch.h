@@ -40,7 +40,9 @@
 #else
 #define _JIT_MAKE_HEADER(arch,header) _JIT_CONCAT4(<cpu/jit/,arch,/,header>)
 #endif
-#if defined(__x86_64__)
+#if defined(__aarch64__)
+#include _JIT_MAKE_HEADER(aarch64,_JIT_HEADER)
+#elif defined(__x86_64__)
 #include _JIT_MAKE_HEADER(amd64,_JIT_HEADER)
 #elif defined(__i386__)
 #include _JIT_MAKE_HEADER(x86,_JIT_HEADER)

@@ -91,6 +91,7 @@
 #include <sys/shm.h>
 #include <sys/stat.h>
 #include <sys/param.h>
+#include <sys/syscall.h>
 #include <signal.h>
 #include <string>
 
@@ -691,6 +692,17 @@ static bool install_signal_handlers(void)
 		return false;
 	}
 #endif
+
+	// Install SIGUSR1 handler for diagnostic register dumps
+	extern void DumpPPCRegisters(void);
+	struct sigaction sigusr1_action;
+	sigemptyset(&sigusr1_action.sa_mask);
+	sigusr1_action.sa_handler = [](int) {
+		DumpPPCRegisters();
+	};
+	sigusr1_action.sa_flags = 0;
+	sigaction(SIGUSR1, &sigusr1_action, NULL);
+
 	return true;
 }
 
@@ -710,7 +722,7 @@ static bool init_sdl()
 	assert(sdl_flags != 0);
 
 #ifdef USE_SDL_VIDEO
-#if REAL_ADDRESSING && defined(GDK_WINDOWING_WAYLAND)
+#if REAL_ADDRESSING && defined(GDK_WINDOWING_WAYLAND) && !defined(__aarch64__)
 	// Needed to fix a crash when using Wayland
 	// Forces use of XWayland instead
 	setenv("SDL_VIDEODRIVER", "x11", true);
@@ -1004,7 +1016,7 @@ int main(int argc, char **argv)
 		goto quit;
 	}
 
-#if !(defined(__APPLE__) && defined(__x86_64__) || defined(MEM_BULK))
+#if !(defined(__APPLE__) && defined(__x86_64__))
 	// Create areas for Kernel Data
 	if (!kernel_data_init())
 		goto quit;
@@ -1316,28 +1328,79 @@ static void Quit(void)
 
 static bool kernel_data_init(void)
 {
-	int error_string = STR_KD_SHMGET_ERR;
 	uint32 kernel_area_size = (KERNEL_AREA_SIZE + SHMLBA - 1) & -SHMLBA;
+	fprintf(stderr, "KD init: SHMLBA=0x%x KERNEL_AREA_SIZE=0x%x kernel_area_size=0x%x\n",
+		(unsigned)SHMLBA, (unsigned)KERNEL_AREA_SIZE, kernel_area_size);
+	fprintf(stderr, "KD init: KD_BASE=0x%lx aligned=0x%lx KD2_BASE=0x%lx aligned=0x%lx\n",
+		(unsigned long)KERNEL_DATA_BASE, (unsigned long)(KERNEL_DATA_BASE & -SHMLBA),
+		(unsigned long)KERNEL_DATA2_BASE, (unsigned long)(KERNEL_DATA2_BASE & -SHMLBA));
+
+	// Try SysV shared memory first
 	int kernel_area = shmget(IPC_PRIVATE, kernel_area_size, 0600);
 	if (kernel_area != -1) {
 		bool mapped =
 			shm_map_address(kernel_area, KERNEL_DATA_BASE & -SHMLBA) &&
 			shm_map_address(kernel_area, KERNEL_DATA2_BASE & -SHMLBA);
-
-		// Mark the shared memory segment for removal. This is safe to do
-		// because the deletion is not performed while the memory is still
-		// mapped and so will only be done once the process exits.
 		shmctl(kernel_area, IPC_RMID, NULL);
 		if (mapped)
 			return true;
-
-		error_string = STR_KD_SHMAT_ERR;
 	}
 
-	char str[256];
-	sprintf(str, GetString(error_string), strerror(errno));
-	ErrorAlert(str);
-	return false;
+	// Fallback: shared mmap for kernels without SysV IPC
+	int fd = -1;
+
+#ifdef SYS_memfd_create
+	fd = syscall(SYS_memfd_create, "sheepshaver-kd", 0);
+#endif
+	if (fd < 0) {
+		char tmpf[] = "/dev/shm/sheepshaver-kd-XXXXXX";
+		fd = mkstemp(tmpf);
+		if (fd >= 0) unlink(tmpf);
+	}
+	if (fd < 0) {
+		char tmpf[] = "/tmp/sheepshaver-kd-XXXXXX";
+		fd = mkstemp(tmpf);
+		if (fd >= 0) unlink(tmpf);
+	}
+	if (fd < 0) {
+		char str[256];
+		sprintf(str, GetString(STR_KD_SHMGET_ERR), strerror(errno));
+		ErrorAlert(str);
+		return false;
+	}
+	if (ftruncate(fd, kernel_area_size) < 0) {
+		close(fd);
+		char str[256];
+		sprintf(str, GetString(STR_KD_SHMGET_ERR), strerror(errno));
+		ErrorAlert(str);
+		return false;
+	}
+
+	void *addr1 = Mac2HostAddr(KERNEL_DATA_BASE & -SHMLBA);
+	void *addr2 = Mac2HostAddr(KERNEL_DATA2_BASE & -SHMLBA);
+	fprintf(stderr, "KD mmap: addr1=%p addr2=%p size=0x%x fd=%d\n", addr1, addr2, kernel_area_size, fd);
+	munmap(addr1, kernel_area_size);
+	munmap(addr2, kernel_area_size);
+	void *m1 = mmap(addr1, kernel_area_size, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED, fd, 0);
+	void *m2 = mmap(addr2, kernel_area_size, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED, fd, 0);
+	close(fd);
+
+	if (m1 == MAP_FAILED || m2 == MAP_FAILED) {
+		fprintf(stderr, "KD mmap FAILED: m1=%p m2=%p errno=%d (%s)\n",
+			m1, m2, errno, strerror(errno));
+		char str[256];
+		sprintf(str, GetString(STR_KD_SHMAT_ERR), strerror(errno));
+		ErrorAlert(str);
+		return false;
+	}
+	// Verify aliasing works
+	volatile uint32 *p1 = (volatile uint32 *)m1;
+	volatile uint32 *p2 = (volatile uint32 *)m2;
+	*p1 = 0xDEADBEEF;
+	fprintf(stderr, "KD alias verify: wrote 0xDEADBEEF to m1, read 0x%08x from m2 (%s)\n",
+		*p2, (*p2 == 0xDEADBEEF) ? "OK" : "BROKEN!");
+	*p1 = 0;
+	return true;
 }
 
 /*
@@ -1347,6 +1410,10 @@ static bool kernel_data_init(void)
 static bool shm_map_address(int kernel_area, uint32 addr)
 {
 	void *kernel_addr = Mac2HostAddr(addr);
+#ifdef MEM_BULK
+	uint32 kernel_area_size = (KERNEL_AREA_SIZE + SHMLBA - 1) & -SHMLBA;
+	munmap(kernel_addr, kernel_area_size);
+#endif
 	return shmat(kernel_area, kernel_addr, 0) == kernel_addr;
 }
 #endif  // !defined(__APPLE__) || !defined(__x86_64__)
@@ -1360,6 +1427,40 @@ static bool shm_map_address(int kernel_area, uint32 addr)
 void jump_to_rom(uint32 entry)
 {
 	init_emul_ppc();
+
+	// The nanokernel's 68k emulator dispatch loop branches to
+	// EmulatorData+0x38 for certain mode transitions, expecting PPC
+	// trampoline code there.  The patched nanokernel boot skips this
+	// initialization, leaving zeros which causes a SIGSEGV in JIT mode.
+	//
+	// The 68k emulator temporarily repurposes r29/r31 during certain
+	// handlers, so they are corrupted when we arrive here.  We must
+	// restore them from KernelData before re-entering the emulator.
+	//
+	// Trampoline (8 instructions, 32 bytes at ED+0x38 .. ED+0x57):
+	//   1. Load KernelData pointer from low-memory (XLM_KERNEL_DATA)
+	//   2. Restore r29 = KD[0x1074] (opcode dispatch table)
+	//   3. Set    r31 = KD + 0x1000  (EmulatorData base)
+	//   4. Load emulator-init entry from KD[0x1184]
+	//   5. Branch to emulator-init via CTR
+	{
+		uint32 ed = KERNEL_DATA_BASE + 0x1000;
+		// r29 is already corrupted, so we use it as a scratch base.
+		// NB: PPC treats rA=r0 as literal 0, so r0 can't be a base.
+		//
+		// Replicate the "Jump to 68k emulator" calling convention
+		// (r3=EmulatorData, r4=opcode table) so the emulator init
+		// routine at KD[0x1184] sets up the dispatch loop correctly.
+		WriteMacInt32(ed + 0x38, 0x83A00000 | XLM_KERNEL_DATA); // lwz  r29, XLM_KERNEL_DATA(0) -- r29 = KD ptr
+		WriteMacInt32(ed + 0x3C, 0x807D0634);                   // lwz  r3,  0x0634(r29)        -- r3  = EmulatorData ptr
+		WriteMacInt32(ed + 0x40, 0x809D119C);                   // lwz  r4,  0x119c(r29)        -- r4  = opcode table
+		WriteMacInt32(ed + 0x44, 0x3BFD1000);                   // addi r31, r29, 0x1000        -- r31 = EmulatorData
+		WriteMacInt32(ed + 0x48, 0x801D1184);                   // lwz  r0,  0x1184(r29)        -- r0  = emul init entry
+		WriteMacInt32(ed + 0x4C, 0x7C0903A6);                   // mtctr r0
+		WriteMacInt32(ed + 0x50, 0x83BD1074);                   // lwz  r29, 0x1074(r29)        -- r29 = opcode table
+		WriteMacInt32(ed + 0x54, 0x4E800420);                   // bctr
+	}
+
 	emul_ppc(entry);
 }
 #endif

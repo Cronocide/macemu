@@ -1203,6 +1203,19 @@ if [[ "$target_cpu" = "arm" -o "$target_cpu" = "aarch64" ]]; then
   ac_cv_have_skip_instruction=yes
 fi
 
+dnl Force siginfo recovery on aarch64-linux (AC_TRY_RUN fails when cross-compiling)
+case $target_cpu:$target_os in
+  aarch64*:linux*)
+    if [[ -z "$sigsegv_recovery" ]]; then
+      sigsegv_recovery=siginfo
+      AC_DEFINE(HAVE_SIGINFO_T, 1, [Define if your system support extended signals.])
+    fi
+    if [[ "x$WANT_VOSF" = "xno" ]]; then
+      WANT_VOSF=yes
+    fi
+    ;;
+esac
+
 AC_TRANSLATE_DEFINE(HAVE_SIGSEGV_SKIP_INSTRUCTION, "$ac_cv_have_skip_instruction",
   [Define if we can ignore the fault (instruction skipping in SIGSEGV handler).])
 
@@ -1304,6 +1317,10 @@ fi
 case "$host" in
   arm-apple-*)
     AC_DEFINE_UNQUOTED(NATMEM_OFFSET, 0x400000000000, [Define constant offset for Mac address translation])
+    ;;
+  aarch64-*-linux-*)
+    AC_DEFINE(MEM_BULK, 1, [Use bulk memory allocation instead of SysV SHM.])
+    WANT_ADDRESSING_MODE="direct (MEM_BULK)"
     ;;
 esac
 
@@ -1589,6 +1606,9 @@ if [[ "x$EMULATED_PPC" = "xyes" ]]; then
       mips:elf)
         ac_cv_use_dyngen=yes
         ;;
+      aarch64:elf)
+        ac_cv_use_dyngen=yes
+        ;;
       powerpc:mach)
         ac_cv_use_dyngen=yes
         ;;
@@ -1603,16 +1623,26 @@ if [[ "x$EMULATED_PPC" = "xyes" ]]; then
         ;;
       esac
       dnl Check for a suitable synthetic opcodes compiler (icc is faking itself as gcc 3.2.2)
-      if [[ -z "$DYNGEN_CC" ]]; then
-        if [[ "x$HAVE_GCC27" = "xyes" -a "x$HAVE_GCC40" = "xno" -a "x$HAVE_ICC" = "xno" ]]; then
+      if [[ -z "$DYNGEN_CC" -o "x$DYNGEN_CC" = "xprecompiled" ]]; then
+        case $host_cpu in
+        aarch64)
+          dnl AArch64 requires modern GCC; accept current compiler
           DYNGEN_CC=$CXX
-        elif command -v g++ >/dev/null; then
-          vers=`g++ -dumpversion`
-          version() { echo "$@" | awk -F. '{ printf("%d%03d%03d%03d\n", $1,$2,$3,$4); }'; }
-          if [[ $(version $vers) -ge $(version "2.7.0") ]] && [[ $(version $vers) -lt $(version "4.0.0") ]]; then
-            DYNGEN_CC="$gxx"
+          ;;
+        *)
+          if [[ "x$DYNGEN_CC" != "xprecompiled" ]]; then
+            if [[ "x$HAVE_GCC27" = "xyes" -a "x$HAVE_GCC40" = "xno" -a "x$HAVE_ICC" = "xno" ]]; then
+              DYNGEN_CC=$CXX
+            elif command -v g++ >/dev/null; then
+              vers=`g++ -dumpversion`
+              version() { echo "$@" | awk -F. '{ printf("%d%03d%03d%03d\n", $1,$2,$3,$4); }'; }
+              if [[ $(version $vers) -ge $(version "2.7.0") ]] && [[ $(version $vers) -lt $(version "4.0.0") ]]; then
+                DYNGEN_CC="$gxx"
+              fi
+            fi
           fi
-        fi
+          ;;
+        esac
       fi
       if [[ -z "$DYNGEN_CC" -o "x$DYNGEN_CC" = "xprecompiled" ]]; then
         case $host_cpu in
@@ -1641,6 +1671,9 @@ if [[ "x$EMULATED_PPC" = "xyes" ]]; then
         if [[ "x$ac_cv_object_format" = "xmach" ]]; then
           DYNGEN_OP_FLAGS="-mdynamic-no-pic"
         fi
+        ;;
+      aarch64)
+        DYNGEN_OP_FLAGS="-fno-pic -fno-plt -ffixed-x19 -ffixed-x20 -ffixed-x21 -ffixed-x22 -ffixed-x23 -ffixed-x24 -ffixed-x25 -ffixed-x26 -ffixed-x27 -ffixed-x28 -mcmodel=large -fno-lto"
         ;;
       esac
       have_dyngen_gcc3=no
@@ -1701,6 +1734,15 @@ if [[ "x$HAVE_IPA" = "xyes" ]]; then
   CXXFLAGS="-LANG:std $CXXFLAGS"
   LDFLAGS="$LDFLAGS -O3 -OPT:Olimit=0 -IPA"
 fi
+
+dnl Optimizations for aarch64 (Cortex-A53 / H700)
+case $host_cpu in
+  aarch64*)
+    CPPFLAGS="$CPPFLAGS -DPPC_AARCH64_JIT_DEBUG=1 -DDYNGEN_DIRECT_BLOCK_CHAINING=1"
+    CFLAGS="$CFLAGS -mcpu=cortex-a53 -O2"
+    CXXFLAGS="$CXXFLAGS -mcpu=cortex-a53 -O2"
+    ;;
+esac
 
 dnl Check for linker script support
 case $target_os:$target_cpu in

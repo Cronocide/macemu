@@ -1767,3 +1767,116 @@ DEFINE_OP(vminsh, pminsw, V0, V1);
 
 #undef DEFINE_OP
 #endif
+
+/**
+ *		AArch64 NEON optimizations
+ **/
+
+#if defined(__aarch64__)
+
+#define DEFINE_NEON_OP(NAME, INSN)										\
+void op_neon_##NAME(void)												\
+{																		\
+	asm volatile ("ldr q0, [%1]\n"										\
+				  "ldr q1, [%2]\n"										\
+				  INSN "\n"												\
+				  "str q0, [%0]\n"										\
+				  : : "r" (reg_VD), "r" (reg_V0), "r" (reg_V1)			\
+				  : "v0", "v1", "memory");								\
+}
+
+DEFINE_NEON_OP(vaddubm, "add v0.16b, v0.16b, v1.16b")
+DEFINE_NEON_OP(vadduhm, "add v0.8h, v0.8h, v1.8h")
+DEFINE_NEON_OP(vadduwm, "add v0.4s, v0.4s, v1.4s")
+DEFINE_NEON_OP(vsububm, "sub v0.16b, v0.16b, v1.16b")
+DEFINE_NEON_OP(vsubuhm, "sub v0.8h, v0.8h, v1.8h")
+DEFINE_NEON_OP(vsubuwm, "sub v0.4s, v0.4s, v1.4s")
+DEFINE_NEON_OP(vand, "and v0.16b, v0.16b, v1.16b")
+DEFINE_NEON_OP(vandc, "bic v0.16b, v0.16b, v1.16b")
+DEFINE_NEON_OP(vor, "orr v0.16b, v0.16b, v1.16b")
+DEFINE_NEON_OP(vxor, "eor v0.16b, v0.16b, v1.16b")
+DEFINE_NEON_OP(vcmpequb, "cmeq v0.16b, v0.16b, v1.16b")
+DEFINE_NEON_OP(vcmpequh, "cmeq v0.8h, v0.8h, v1.8h")
+DEFINE_NEON_OP(vcmpequw, "cmeq v0.4s, v0.4s, v1.4s")
+DEFINE_NEON_OP(vcmpgtsb, "cmgt v0.16b, v0.16b, v1.16b")
+DEFINE_NEON_OP(vcmpgtsh, "cmgt v0.8h, v0.8h, v1.8h")
+DEFINE_NEON_OP(vcmpgtsw, "cmgt v0.4s, v0.4s, v1.4s")
+DEFINE_NEON_OP(vmaxub, "umax v0.16b, v0.16b, v1.16b")
+DEFINE_NEON_OP(vminub, "umin v0.16b, v0.16b, v1.16b")
+DEFINE_NEON_OP(vmaxsh, "smax v0.8h, v0.8h, v1.8h")
+DEFINE_NEON_OP(vminsh, "smin v0.8h, v0.8h, v1.8h")
+DEFINE_NEON_OP(vaddfp, "fadd v0.4s, v0.4s, v1.4s")
+DEFINE_NEON_OP(vsubfp, "fsub v0.4s, v0.4s, v1.4s")
+DEFINE_NEON_OP(vmaxfp, "fmax v0.4s, v0.4s, v1.4s")
+DEFINE_NEON_OP(vminfp, "fmin v0.4s, v0.4s, v1.4s")
+DEFINE_NEON_OP(vavgub, "urhadd v0.16b, v0.16b, v1.16b")
+DEFINE_NEON_OP(vavguh, "urhadd v0.8h, v0.8h, v1.8h")
+DEFINE_NEON_OP(vcmpeqfp, "fcmeq v0.4s, v0.4s, v1.4s")
+DEFINE_NEON_OP(vcmpgefp, "fcmge v0.4s, v0.4s, v1.4s")
+DEFINE_NEON_OP(vcmpgtfp, "fcmgt v0.4s, v0.4s, v1.4s")
+
+#undef DEFINE_NEON_OP
+
+void op_neon_vnor(void)
+{
+	asm volatile ("ldr q0, [%1]\n"
+				  "ldr q1, [%2]\n"
+				  "orr v0.16b, v0.16b, v1.16b\n"
+				  "not v0.16b, v0.16b\n"
+				  "str q0, [%0]\n"
+				  : : "r" (reg_VD), "r" (reg_V0), "r" (reg_V1)
+				  : "v0", "v1", "memory");
+}
+
+void op_neon_vrefp(void)
+{
+	asm volatile ("ldr q0, [%1]\n"
+				  "frecpe v0.4s, v0.4s\n"
+				  "str q0, [%0]\n"
+				  : : "r" (reg_VD), "r" (reg_V1)
+				  : "v0", "memory");
+}
+
+void op_neon_vrsqrtefp(void)
+{
+	asm volatile ("ldr q0, [%1]\n"
+				  "frsqrte v0.4s, v0.4s\n"
+				  "str q0, [%0]\n"
+				  : : "r" (reg_VD), "r" (reg_V1)
+				  : "v0", "memory");
+}
+
+void op_neon_vmaddfp(void)
+{
+	asm volatile ("ldr q0, [%2]\n"
+				  "ldr q1, [%1]\n"
+				  "ldr q2, [%3]\n"
+				  "fmla v0.4s, v1.4s, v2.4s\n"
+				  "str q0, [%0]\n"
+				  : : "r" (reg_VD), "r" (reg_V0), "r" (reg_V1), "r" (reg_V2)
+				  : "v0", "v1", "v2", "memory");
+}
+
+void op_neon_vnmsubfp(void)
+{
+	asm volatile ("ldr q0, [%2]\n"
+				  "ldr q1, [%1]\n"
+				  "ldr q2, [%3]\n"
+				  "fmls v0.4s, v1.4s, v2.4s\n"
+				  "str q0, [%0]\n"
+				  : : "r" (reg_VD), "r" (reg_V0), "r" (reg_V1), "r" (reg_V2)
+				  : "v0", "v1", "v2", "memory");
+}
+
+void op_neon_vsel(void)
+{
+	asm volatile ("ldr q0, [%3]\n"
+				  "ldr q1, [%2]\n"
+				  "ldr q2, [%1]\n"
+				  "bsl v0.16b, v1.16b, v2.16b\n"
+				  "str q0, [%0]\n"
+				  : : "r" (reg_VD), "r" (reg_V0), "r" (reg_V1), "r" (reg_V2)
+				  : "v0", "v1", "v2", "memory");
+}
+
+#endif /* __aarch64__ */

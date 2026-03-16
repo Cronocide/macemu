@@ -48,4 +48,7 @@ extern bool cpuinfo_check_sse4_2(void);
 // Check for ppc feature VMX (Altivec)
 extern bool cpuinfo_check_altivec(void);
 
+// Check for AArch64 feature NEON (Advanced SIMD)
+extern bool cpuinfo_check_neon(void);
+
 #endif /* UTILS_CPUINFO_H */

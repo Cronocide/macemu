@@ -39,10 +39,11 @@ powerpc_jit::powerpc_jit(dyngen_cpu_base cpu)
 {
 }
 
-// An operand that refers to an address relative to the emulated machine
+#if defined(__i386__) || defined(__x86_64__)
 static x86_memory_operand vm_memory_operand(int32 d, int b, int i = X86_NOREG, int s = 1) {
 	return x86_memory_operand(d + VMBaseDiff, b, i, s);
 }
+#endif
 
 bool powerpc_jit::initialize(void)
 {
@@ -90,6 +91,57 @@ bool powerpc_jit::initialize(void)
 		};
 		for (int i = 0; i < sizeof(gen_vector) / sizeof(gen_vector[0]); i++)
 			jit_info[gen_vector[i].mnemo] = &gen_vector[i];
+
+#if defined(__aarch64__)
+		static const jit_info_t neon_vector[] = {
+#define DEFINE_OP(MNEMO, GEN_OP, DYNGEN_OP) \
+			{ PPC_I(MNEMO), (gen_handler_t)&powerpc_jit::gen_vector_generic_##GEN_OP, &powerpc_dyngen::gen_op_neon_##DYNGEN_OP }
+			DEFINE_OP(VADDUBM,	2, vaddubm),
+			DEFINE_OP(VADDUHM,	2, vadduhm),
+			DEFINE_OP(VADDUWM,	2, vadduwm),
+			DEFINE_OP(VSUBUBM,	2, vsububm),
+			DEFINE_OP(VSUBUHM,	2, vsubuhm),
+			DEFINE_OP(VSUBUWM,	2, vsubuwm),
+			DEFINE_OP(VAND,		2, vand),
+			DEFINE_OP(VANDC,	2, vandc),
+			DEFINE_OP(VNOR,		2, vnor),
+			DEFINE_OP(VOR,		2, vor),
+			DEFINE_OP(VXOR,		2, vxor),
+			DEFINE_OP(VADDFP,	2, vaddfp),
+			DEFINE_OP(VSUBFP,	2, vsubfp),
+			DEFINE_OP(VMAXFP,	2, vmaxfp),
+			DEFINE_OP(VMINFP,	2, vminfp),
+			DEFINE_OP(VMAXUB,	2, vmaxub),
+			DEFINE_OP(VMINUB,	2, vminub),
+			DEFINE_OP(VMAXSH,	2, vmaxsh),
+			DEFINE_OP(VMINSH,	2, vminsh),
+			DEFINE_OP(VAVGUB,	2, vavgub),
+			DEFINE_OP(VAVGUH,	2, vavguh),
+			DEFINE_OP(VREFP,	2, vrefp),
+			DEFINE_OP(VRSQRTEFP,2, vrsqrtefp),
+			DEFINE_OP(VCMPEQUB,	c, vcmpequb),
+			DEFINE_OP(VCMPEQUH,	c, vcmpequh),
+			DEFINE_OP(VCMPEQUW,	c, vcmpequw),
+			DEFINE_OP(VCMPGTSB,	c, vcmpgtsb),
+			DEFINE_OP(VCMPGTSH,	c, vcmpgtsh),
+			DEFINE_OP(VCMPGTSW,	c, vcmpgtsw),
+			DEFINE_OP(VCMPEQFP,	c, vcmpeqfp),
+			DEFINE_OP(VCMPGEFP,	c, vcmpgefp),
+			DEFINE_OP(VCMPGTFP,	c, vcmpgtfp),
+#undef DEFINE_OP
+#define DEFINE_OP(MNEMO, GEN_OP, DYNGEN_OP) \
+			{ PPC_I(MNEMO), (gen_handler_t)&powerpc_jit::gen_vector_generic_##GEN_OP, &powerpc_dyngen::gen_op_neon_##DYNGEN_OP }
+			DEFINE_OP(VMADDFP,	3, vmaddfp),
+			DEFINE_OP(VNMSUBFP,	3, vnmsubfp),
+			DEFINE_OP(VSEL,		3, vsel),
+#undef DEFINE_OP
+		};
+
+		if (cpuinfo_check_neon()) {
+			for (int i = 0; i < sizeof(neon_vector) / sizeof(neon_vector[0]); i++)
+				jit_info[neon_vector[i].mnemo] = &neon_vector[i];
+		}
+#endif
 
 #if defined(__i386__) || defined(__x86_64__)
 		// x86 optimized handlers

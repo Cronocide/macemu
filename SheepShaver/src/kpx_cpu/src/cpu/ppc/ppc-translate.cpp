@@ -76,6 +76,7 @@ static inline bool direct_chaining_possible(uint32 bpc, uint32 tpc)
 #define TARGET_POWERPC	1
 #define TARGET_X86		2
 #define TARGET_AMD64	3
+#define TARGET_AARCH64	4
 #if defined(i386) || defined(__i386__)
 #define TARGET_NATIVE	TARGET_X86
 #endif
@@ -85,26 +86,37 @@ static inline bool direct_chaining_possible(uint32 bpc, uint32 tpc)
 #if defined(powerpc) || defined(__powerpc__) || defined(__ppc__)
 #define TARGET_NATIVE	TARGET_POWERPC
 #endif
+#if defined(__aarch64__)
+#define TARGET_NATIVE	TARGET_AARCH64
+#endif
 
 #if PPC_ENABLE_JIT
 static void disasm_block(int target, uint8 *start, uint32 length)
 {
 #if ENABLE_MON
-	char disasm_str[200];
-	sprintf(disasm_str, "%s $%x $%x",
-			target == TARGET_M68K ? "d68" :
-			target == TARGET_X86 ? "d86" :
-			target == TARGET_AMD64 ? "d8664" :
-			target == TARGET_POWERPC ? "d" : "x",
-			start, start + length - 1);
+	if (target != TARGET_AARCH64) {
+		char disasm_str[200];
+		sprintf(disasm_str, "%s $%x $%x",
+				target == TARGET_M68K ? "d68" :
+				target == TARGET_X86 ? "d86" :
+				target == TARGET_AMD64 ? "d8664" :
+				target == TARGET_POWERPC ? "d" : "x",
+				start, start + length - 1);
 
-	const char *arg[] = {"mon",
+		const char *arg[] = {"mon",
 #ifdef SHEEPSHAVER
 				   "-m",
 #endif
 				   "-r", disasm_str, NULL};
-	mon(sizeof(arg)/sizeof(arg[0]) - 1, arg);
+		mon(sizeof(arg)/sizeof(arg[0]) - 1, arg);
+		return;
+	}
 #endif
+	if (target == TARGET_AARCH64) {
+		uint32 *insn = (uint32 *)start;
+		for (uint32 i = 0; i < length; i += 4)
+			printf("  %p:  %08x\n", (void *)(start + i), *insn++);
+	}
 }
 
 static void disasm_translation(uint32 src_addr, uint32 src_len,
@@ -180,6 +192,12 @@ powerpc_cpu::compile_block(uint32 entry_point)
 		uint32 opcode = vm_read_memory_4(dpc += 4);
 		const instr_info_t *ii = decode(opcode);
 		if (ii->cflow & CFLOW_END_BLOCK)
+			done_compile = true;
+
+		// PPC primary opcode 0 is reserved/illegal; terminate block here
+		// so spcflags (interrupts) are checked after each illegal insn,
+		// matching interpreter behavior.
+		if ((opcode >> 26) == 0)
 			done_compile = true;
 
 		// Assume we can compile this opcode
@@ -545,9 +563,13 @@ powerpc_cpu::compile_block(uint32 entry_point)
 			break;
 		}
 		case PPC_I(BCCTR):		// Branch Conditional to Count Register
+			if (dpc >= 0x5046e180 && dpc <= 0x5046e200)
+				fprintf(stderr, "[JIT:XLATE] BCCTR at 0x%08x opcode=0x%08x\n", dpc, opcode);
 			dg.gen_load_T0_CTR_aligned();
 			goto do_branch;
 		case PPC_I(BCLR):		// Branch Conditional to Link Register
+			if (dpc >= 0x5046e180 && dpc <= 0x5046e200)
+				fprintf(stderr, "[JIT:XLATE] BCLR at 0x%08x opcode=0x%08x\n", dpc, opcode);
 			dg.gen_load_T0_LR_aligned();
 			goto do_branch;
 		{
@@ -1432,8 +1454,10 @@ powerpc_cpu::compile_block(uint32 entry_point)
 		case PPC_I(VANDC):
 		case PPC_I(VAVGUB):
 		case PPC_I(VAVGUH):
+		case PPC_I(VMAXFP):
 		case PPC_I(VMAXSH):
 		case PPC_I(VMAXUB):
+		case PPC_I(VMINFP):
 		case PPC_I(VMINSH):
 		case PPC_I(VMINUB):
 		case PPC_I(VNOR):
@@ -1522,6 +1546,7 @@ powerpc_cpu::compile_block(uint32 entry_point)
 			goto do_invoke;
 		  do_illegal:
 			func = &powerpc_cpu::call_execute_illegal;
+			done_compile = true;
 			goto do_invoke;	
 		  do_invoke:
 #if PPC_PROFILE_GENERIC_CALLS
@@ -1603,6 +1628,18 @@ powerpc_cpu::compile_block(uint32 entry_point)
 	bi->size = dg.code_ptr() - bi->entry_point;
 	if (disasm)
 		disasm_translation(entry_point, dpc - entry_point + 4, bi->entry_point, bi->size);
+
+	if (entry_point >= 0x5046e180 && entry_point <= 0x5046e200) {
+		fprintf(stderr, "[JIT:BLOCK] Compiled block at PPC 0x%08x, native %p, size %u bytes\n",
+			entry_point, bi->entry_point, bi->size);
+		for (unsigned i = 0; i < bi->size; i += 4) {
+			if (i + 4 <= bi->size) {
+				uint32 insn = *(const uint32 *)(bi->entry_point + i);
+				fprintf(stderr, "  +%04x: %08x\n", i, insn);
+			}
+		}
+		fflush(stderr);
+	}
 
 	dg.gen_end();
 	my_block_cache.add_to_cl_list(bi);

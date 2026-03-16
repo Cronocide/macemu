@@ -101,6 +101,20 @@
 
 
 /**
+ *	PPC_AARCH64_JIT_DEBUG
+ *
+ *		Debug instrumentation for the AArch64 JIT backend.
+ *		0 = off, 1 = summary (compile/dispatch/chain events),
+ *		2 = verbose (+ hex dumps of generated native code).
+ *		Defaults to 1 on aarch64 builds, 0 elsewhere.
+ **/
+
+#ifndef PPC_AARCH64_JIT_DEBUG
+#define PPC_AARCH64_JIT_DEBUG 0
+#endif
+
+
+/**
  *	PPC_FLIGHT_RECORDER
  *
  *		Define to enable the flight recorder. If set to 2, the
@@ -109,7 +123,11 @@
  **/
 
 #ifndef PPC_FLIGHT_RECORDER
+#if PPC_AARCH64_JIT_DEBUG
+#define PPC_FLIGHT_RECORDER 1
+#else
 #define PPC_FLIGHT_RECORDER 0
+#endif
 #endif
 
 

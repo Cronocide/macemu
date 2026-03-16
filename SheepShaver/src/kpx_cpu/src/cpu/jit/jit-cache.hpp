@@ -87,6 +87,10 @@ public:
 
 	// Emit data to constant pool
 	uint8 *copy_data(const uint8 *block, uint32 size);
+
+	// Cache statistics for debug visibility
+	uint32 get_cache_size() const	{ return cache_size; }
+	uint32 get_cache_used() const	{ return (uint32)(code_p - code_start); }
 };
 
 inline void

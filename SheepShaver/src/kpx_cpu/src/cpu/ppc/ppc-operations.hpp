@@ -110,8 +110,8 @@ DEFINE_ALIAS_OP(eqv, eqv, uint32);
 DEFINE_OP2(shll, uint32, x << y);
 DEFINE_OP2(shrl, uint32, x >> y);
 DEFINE_OP2(shra, uint32, (int32)x >> y);
-DEFINE_OP2(rotl, uint32, ((x << y) | (x >> (32 - y))));
-DEFINE_OP2(rotr, uint32, ((x >> y) | (x << (32 - y))));
+DEFINE_OP2(rotl, uint32, ((x << (y & 31)) | (x >> ((32 - y) & 31))));
+DEFINE_OP2(rotr, uint32, ((x >> (y & 31)) | (x << ((32 - y) & 31))));
 
 DEFINE_OP4(ppc_rlwimi, uint32, (op_rotl::apply(x, y) & z) | (t & ~z));
 DEFINE_OP3(ppc_rlwinm, uint32, (op_rotl::apply(x, y) & z));

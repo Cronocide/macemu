@@ -96,6 +96,18 @@ extern int __op_PARAM3 __hidden;
 #define PARAM1 PARAMN(1)
 #define PARAM2 PARAMN(2)
 #define PARAM3 PARAMN(3)
+#elif defined __aarch64__
+/* On AArch64 with -mcmodel=large, use movz/movk to materialize
+ * 64-bit absolute addresses that dyngen can patch via MOVW_UABS relocations. */
+#define PARAMN(index) ({ register long _r; \
+		asm("movz %0, #:abs_g3:__op_PARAM" #index "\n\t" \
+		    "movk %0, #:abs_g2_nc:__op_PARAM" #index "\n\t" \
+		    "movk %0, #:abs_g1_nc:__op_PARAM" #index "\n\t" \
+		    "movk %0, #:abs_g0_nc:__op_PARAM" #index \
+		    : "=r"(_r)); _r; })
+#define PARAM1 PARAMN(1)
+#define PARAM2 PARAMN(2)
+#define PARAM3 PARAMN(3)
 #else
 #if defined(__APPLE__) && defined(__MACH__)
 static int __op_PARAM1, __op_PARAM2, __op_PARAM3;
@@ -113,6 +125,9 @@ extern int __op_PARAM1, __op_PARAM2, __op_PARAM3;
 #endif
 #if defined(__i386__) || defined(__x86_64__)
 #define DYNGEN_FAST_DISPATCH(TARGET) asm volatile ("jmp " ASM_NAME(TARGET))
+#endif
+#if defined(__aarch64__)
+#define DYNGEN_FAST_DISPATCH(TARGET) asm volatile ("b " ASM_NAME(TARGET))
 #endif
 
 #define DYNGEN_SLOW_DISPATCH(TARGET) do {								\
