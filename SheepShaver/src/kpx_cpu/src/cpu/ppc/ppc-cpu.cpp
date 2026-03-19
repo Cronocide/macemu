@@ -40,6 +40,10 @@
 #define DEBUG 0
 #include "debug.h"
 
+#ifdef SHEEPSHAVER
+#include "timer.h"
+#endif
+
 #if PPC_PROFILE_GENERIC_CALLS
 uint32 powerpc_cpu::generic_calls_count[PPC_I(MAX)];
 static int generic_calls_ids[PPC_I(MAX)];
@@ -520,6 +524,21 @@ void powerpc_registers::interrupt_copy(powerpc_registers &oregs, powerpc_registe
 
 bool powerpc_cpu::check_spcflags()
 {
+#ifdef SHEEPSHAVER
+	static bool processing_interrupt = false;
+	static uint64 interrupt_enter_time = 0;
+
+	if (execute_depth > 1 && processing_interrupt) {
+		static unsigned int watchdog_counter = 0;
+		if ((++watchdog_counter & 0x3F) == 0) {
+			uint64 elapsed = GetTicks_usec() - interrupt_enter_time;
+			if (elapsed > 200000) {
+				spcflags().set(SPCFLAG_CPU_EXEC_RETURN);
+				return false;
+			}
+		}
+	}
+#endif
 #if PPC_AARCH64_JIT_DEBUG
 	static unsigned long spc_check_count = 0;
 	spc_check_count++;
@@ -537,14 +556,18 @@ bool powerpc_cpu::check_spcflags()
 #endif
 	if (spcflags().test(SPCFLAG_CPU_EXEC_RETURN)) {
 		spcflags().clear(SPCFLAG_CPU_EXEC_RETURN);
+#ifdef SHEEPSHAVER
+		if (execute_depth <= 1)
+			return true;
+#endif
 		return false;
 	}
 #ifdef SHEEPSHAVER
 	if (spcflags().test(SPCFLAG_CPU_HANDLE_INTERRUPT)) {
 		spcflags().clear(SPCFLAG_CPU_HANDLE_INTERRUPT);
-		static bool processing_interrupt = false;
 		if (!processing_interrupt) {
 			processing_interrupt = true;
+			interrupt_enter_time = GetTicks_usec();
 			powerpc_registers r;
 			powerpc_registers::interrupt_copy(r, regs());
 			HandleInterrupt(&r);

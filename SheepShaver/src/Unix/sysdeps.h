@@ -371,6 +371,22 @@ static inline int testandset(volatile int *p)
 }
 #endif
 
+#ifdef __aarch64__
+#define HAVE_TEST_AND_SET 1
+static inline int testandset(volatile int *p)
+{
+	int ret, tmp;
+	__asm__ __volatile__(
+		"1:	ldaxr	%w0, [%2]\n"
+		"	stlxr	%w1, %w3, [%2]\n"
+		"	cbnz	%w1, 1b\n"
+		: "=&r"(ret), "=&r"(tmp)
+		: "r"(p), "r"(1)
+		: "memory");
+	return ret;
+}
+#endif
+
 #endif /* __GNUC__ */
 
 typedef volatile int spinlock_t;
@@ -387,7 +403,11 @@ static inline void spin_lock(spinlock_t *lock)
 
 static inline void spin_unlock(spinlock_t *lock)
 {
+#ifdef __aarch64__
+	__asm__ __volatile__("stlr %w1, [%0]" : : "r"(lock), "r"(0) : "memory");
+#else
 	*lock = 0;
+#endif
 }
 
 static inline int spin_trylock(spinlock_t *lock)

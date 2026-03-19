@@ -35,7 +35,7 @@ enum {
 
 class basic_spcflags
 {
-	uint32 mask;
+	volatile uint32 mask;
 	spinlock_t lock;
 
 public:
@@ -47,22 +47,22 @@ public:
 		{ mask = 0; lock = SPIN_LOCK_UNLOCKED; }
 
 	bool empty() const
-		{ return (mask == 0); }
+		{ return (__atomic_load_n(const_cast<uint32*>(&mask), __ATOMIC_ACQUIRE) == 0); }
 
 	bool test(uint32 v) const
-		{ return (mask & v); }
+		{ return (__atomic_load_n(const_cast<uint32*>(&mask), __ATOMIC_ACQUIRE) & v); }
 
 	void init(uint32 v)
 		{ spin_lock(&lock); mask = v; spin_unlock(&lock); }
 
 	uint32 get() const
-		{ return mask; }
+		{ return __atomic_load_n(const_cast<uint32*>(&mask), __ATOMIC_ACQUIRE); }
 
 	void set(uint32 v)
-		{ spin_lock(&lock); mask |= v; spin_unlock(&lock); }
+		{ spin_lock(&lock); __atomic_or_fetch(const_cast<uint32*>(&mask), v, __ATOMIC_RELEASE); spin_unlock(&lock); }
 
 	void clear(uint32 v)
-		{ spin_lock(&lock); mask &= ~v; spin_unlock(&lock); }
+		{ spin_lock(&lock); __atomic_and_fetch(const_cast<uint32*>(&mask), ~v, __ATOMIC_RELEASE); spin_unlock(&lock); }
 };
 
 #endif /* SPCFLAGS_H */
