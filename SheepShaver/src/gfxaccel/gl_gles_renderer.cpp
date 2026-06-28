@@ -19,6 +19,8 @@
 
 #include "sysdeps.h"
 #include "cpu_emulation.h"
+#include "timing_log.h"
+#include "prefs.h"
 #include "gl_engine.h"
 #include "rave_metal_renderer.h"
 #include "gles_compositor.h"
@@ -43,6 +45,40 @@ extern "C" __attribute__((weak)) void video_request_gl_refresh(void) {}
 #else
 extern "C" void video_request_gl_refresh(void) {}
 #endif
+
+// Lightweight GL 1.2 renderer perf counters (gated by "perf_profile" pref)
+static bool   gl_perf_init   = false;
+static bool   gl_perf        = false;
+static uint64 gl_perf_frames = 0;
+static uint64 gl_perf_draws  = 0;
+static uint64 gl_perf_verts  = 0;
+static uint64 gl_perf_window = 0;
+
+static void gl_perf_report(void)
+{
+	if (!gl_perf) return;
+	const uint64 now = GetTicks_usec();
+	if (gl_perf_window == 0) { gl_perf_window = now; return; }
+	const uint64 elapsed = now - gl_perf_window;
+	if (elapsed < 2000000) return;
+	const double secs = elapsed / 1000000.0;
+	const double f = gl_perf_frames ? (double)gl_perf_frames : 1.0;
+	printf("[perf:gl] %.2fs | %llu frames (%.1f fps) | draws %.1f/frame | verts %.0f/frame\n",
+		secs, (unsigned long long)gl_perf_frames, gl_perf_frames / secs,
+		gl_perf_draws / f, gl_perf_verts / f);
+	fflush(stdout);
+	if (timing_log_active) {
+		char _buf[256];
+		snprintf(_buf, sizeof(_buf),
+			"\"elapsed_s\":%.3f,\"frames\":%llu,\"fps\":%.2f,"
+			"\"draws_per_frame\":%.2f,\"verts_per_frame\":%.1f",
+			secs, (unsigned long long)gl_perf_frames, gl_perf_frames / secs,
+			gl_perf_draws / f, gl_perf_verts / f);
+		timing_log_emit("perf_gl", _buf);
+	}
+	gl_perf_frames = gl_perf_draws = gl_perf_verts = 0;
+	gl_perf_window = now;
+}
 
 // Guest-side GL 1.2 constants (values that GLES headers may already provide
 // are guarded; the rest are OpenGL 1.2-only and absent from GLES headers).
@@ -935,6 +971,7 @@ static void DrawPreparedVertices(GLContext *ctx, GLGLESState *gs,
 	glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, (GLsizei)sizeof(GLGLESVertex), (void *)44);
 
 	glDrawArrays(gl_prim, 0, (GLsizei)vertCount);
+	if (gl_perf) { gl_perf_draws++; gl_perf_verts += vertCount; }
 
 	glDisableVertexAttribArray(3);
 	glDisableVertexAttribArray(2);
@@ -1318,6 +1355,10 @@ void GLMetalEndFrame(GLContext *ctx)
 	gs->renderPassActive = false;
 	RestoreGLState(&s_glPassSaved);
 	video_request_gl_refresh();
+
+	if (!gl_perf_init) { gl_perf = PrefsFindBool("perf_profile"); gl_perf_init = true; }
+	gl_perf_frames++;
+	gl_perf_report();
 	GL_LOG("GLMetalEndFrame");
 }
 
