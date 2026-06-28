@@ -72,6 +72,7 @@
 #include "cdrom.h"
 #include "gles_compositor.h"
 #include "video_profile.h"
+#include "timing_log.h"
 
 #define DEBUG 0
 #include "debug.h"
@@ -122,12 +123,65 @@ static uint32 the_buffer_size;						// Size of allocated the_buffer
 bool video_profile_enabled = false;
 VideoProfileCounters video_profile = {};
 
+// Per-frame snapshot for D2 frame budget records
+static uint64 frame_last_phase[VPROF_PHASE_COUNT] = {};
+static uint64 frame_last_blocks = 0;
+static uint64 frame_last_ts_us = 0;
+
+// D3: Frame hashing (env SHEEPSHAVER_FRAME_HASH=1) and screenshot (SIGUSR2)
+static bool frame_hash_enabled = false;
+extern volatile sig_atomic_t screenshot_requested;
+
+static uint32_t simple_crc32(const uint8_t *data, size_t len)
+{
+	uint32_t crc = 0xFFFFFFFFu;
+	for (size_t i = 0; i < len; i++) {
+		crc ^= data[i];
+		for (int j = 0; j < 8; j++)
+			crc = (crc >> 1) ^ (crc & 1 ? 0xEDB88320u : 0u);
+	}
+	return crc ^ 0xFFFFFFFFu;
+}
+
 void video_profile_frame_end(void)
 {
 	if (!video_profile_enabled)
 		return;
 	video_profile.present_frames++;
 	const uint64 now = GetTicks_usec();
+
+	// D2: Per-frame budget record emitted every present when timing log is active
+	if (timing_log_active) {
+		extern uint64 ppc_perf_blocks;
+		extern int64 g_rave_dispatch_us;
+		const uint64 _interval = frame_last_ts_us ? (now - frame_last_ts_us) : 0;
+		char _buf[320];
+		snprintf(_buf, sizeof(_buf),
+			"\"scan_us\":%llu,\"conv_us\":%llu,\"upload_us\":%llu,\"render_us\":%llu,"
+			"\"jit_blocks\":%llu,\"rave_us\":%lld,\"interval_us\":%llu",
+			(unsigned long long)(video_profile.phase_usec[VPROF_SCAN]    - frame_last_phase[VPROF_SCAN]),
+			(unsigned long long)(video_profile.phase_usec[VPROF_CONVERT] - frame_last_phase[VPROF_CONVERT]),
+			(unsigned long long)(video_profile.phase_usec[VPROF_UPLOAD]  - frame_last_phase[VPROF_UPLOAD]),
+			(unsigned long long)(video_profile.phase_usec[VPROF_RENDER]  - frame_last_phase[VPROF_RENDER]),
+			(unsigned long long)(ppc_perf_blocks - frame_last_blocks),
+			(long long)g_rave_dispatch_us,
+			(unsigned long long)_interval);
+		timing_log_emit("frame", _buf);
+		for (int i = 0; i < VPROF_PHASE_COUNT; i++)
+			frame_last_phase[i] = video_profile.phase_usec[i];
+		frame_last_blocks = ppc_perf_blocks;
+		frame_last_ts_us = now;
+	}
+
+	// D3: Per-frame hash of the Mac framebuffer (env-gated, emitted to timing log)
+	if (frame_hash_enabled && timing_log_active && the_buffer && the_buffer_size > 0) {
+		uint32_t h = simple_crc32(the_buffer, the_buffer_size);
+		char _hbuf[80];
+		snprintf(_hbuf, sizeof(_hbuf), "\"hash\":%lu,\"size\":%u",
+			(unsigned long)h, (unsigned)the_buffer_size);
+		timing_log_emit("framehash", _hbuf);
+	}
+
 	if (video_profile.window_start_usec == 0) {
 		video_profile.window_start_usec = now;
 		return;
@@ -154,8 +208,41 @@ void video_profile_frame_end(void)
 		   (unsigned long long)(video_profile.phase_usec[VPROF_RENDER] / 1000),
 		   100.0 * total_usec / (double)elapsed);
 	fflush(stdout);
+	// D1: emit perf_video to timing log
+	if (timing_log_active) {
+		char _buf[384];
+		snprintf(_buf, sizeof(_buf),
+			"\"elapsed_s\":%.3f,\"presents\":%llu,\"fps\":%.2f,"
+			"\"dirty_boxes\":%llu,\"dirty_mpx\":%.3f,"
+			"\"scan_ms\":%llu,\"conv_ms\":%llu,\"upload_ms\":%llu,\"render_ms\":%llu,"
+			"\"busy_pct\":%.2f",
+			secs,
+			(unsigned long long)video_profile.present_frames,
+			video_profile.present_frames / secs,
+			(unsigned long long)video_profile.dirty_boxes,
+			video_profile.dirty_pixels / 1000000.0,
+			(unsigned long long)(video_profile.phase_usec[VPROF_SCAN] / 1000),
+			(unsigned long long)(video_profile.phase_usec[VPROF_CONVERT] / 1000),
+			(unsigned long long)(video_profile.phase_usec[VPROF_UPLOAD] / 1000),
+			(unsigned long long)(video_profile.phase_usec[VPROF_RENDER] / 1000),
+			100.0 * total_usec / (double)elapsed);
+		timing_log_emit("perf_video", _buf);
+	}
 
-	// Reset window
+	// Reset window (also reset per-frame snapshot to avoid stale delta after phase_usec zeroed)
+	for (int i = 0; i < VPROF_PHASE_COUNT; i++) {
+		video_profile.phase_usec[i] = 0;
+		video_profile.phase_calls[i] = 0;
+		frame_last_phase[i] = 0;
+	}
+	video_profile.dirty_boxes = 0;
+	video_profile.dirty_pixels = 0;
+	video_profile.present_frames = 0;
+	video_profile.window_start_usec = now;
+}
+
+void video_profile_reset(void)
+{
 	for (int i = 0; i < VPROF_PHASE_COUNT; i++) {
 		video_profile.phase_usec[i] = 0;
 		video_profile.phase_calls[i] = 0;
@@ -163,7 +250,7 @@ void video_profile_frame_end(void)
 	video_profile.dirty_boxes = 0;
 	video_profile.dirty_pixels = 0;
 	video_profile.present_frames = 0;
-	video_profile.window_start_usec = now;
+	video_profile.window_start_usec = 0;
 }
 
 static bool redraw_thread_active = false;			// Flag: Redraw thread installed
@@ -1259,6 +1346,20 @@ static int present_sdl_video()
     // Update the display
 	SDL_RenderPresent(sdl_renderer);
 
+	// D3: Screenshot on SIGUSR2
+	if (screenshot_requested) {
+		screenshot_requested = 0;
+		const char *dir = getenv("SHEEPSHAVER_SHOT_DIR");
+		if (!dir || !*dir) dir = "/tmp";
+		char _spath[256];
+		snprintf(_spath, sizeof(_spath), "%s/sheepshaver_%llu.bmp", dir,
+			(unsigned long long)GetTicks_usec());
+		if (host_surface) {
+			SDL_SaveBMP(host_surface, _spath);
+			fprintf(stderr, "[screenshot] saved %s\n", _spath);
+		}
+	}
+
 	if (video_profile_enabled) {
 		video_profile_add(VPROF_RENDER, GetTicks_usec() - t_render);
 		video_profile_frame_end();
@@ -1708,6 +1809,7 @@ bool VideoInit(bool classic)
 	// Read prefs
 	frame_skip = PrefsFindInt32("frameskip");
 	video_profile_enabled = PrefsFindBool("perf_profile");
+	{ const char *_e = getenv("SHEEPSHAVER_FRAME_HASH"); frame_hash_enabled = (_e && _e[0] == '1'); }
 	nqd_dirty_tracking = PrefsFindBool("nqd_dirty");
 	nqd_diag_enabled = PrefsFindBool("nqd_diag");
 	present_full_enabled = PrefsFindBool("present_full");

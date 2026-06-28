@@ -21,6 +21,7 @@
 #include "sysdeps.h"
 
 #include "prefs.h"
+#include "timing_log.h"
 #include "video.h"
 #include "video_defs.h"
 #include "thunks.h"
@@ -123,6 +124,25 @@ static void nqd_blit_diag_report(void)
 			   nqd_last_dx, nqd_last_dy, nqd_last_w, nqd_last_h,
 			   nqd_last_dbnd_l, nqd_last_dbnd_t, nqd_last_drb, nqd_last_mode, nqd_last_bpp);
 	fflush(stdout);
+	if (timing_log_active) {
+		char _buf[384];
+		snprintf(_buf, sizeof(_buf),
+			"\"elapsed_s\":%.3f,\"blit_accel\":%llu,\"blit_reject\":%llu,"
+			"\"fill_accel\":%llu,\"fill_reject\":%llu,\"unknown\":%llu,"
+			"\"inter_avg_us\":%llu,\"inter_max_us\":%llu,"
+			"\"reject_area_mpx\":%.3f,\"accel_area_mpx\":%.3f",
+			elapsed / 1000000.0,
+			(unsigned long long)nqd_blit_accel,
+			(unsigned long long)nqd_blit_reject,
+			(unsigned long long)nqd_fill_accel,
+			(unsigned long long)nqd_fill_reject,
+			(unsigned long long)nqd_unknown,
+			(unsigned long long)avg_us,
+			(unsigned long long)nqd_inter_hook_max_us,
+			nqd_reject_area_px / 1e6,
+			nqd_accel_area_px / 1e6);
+		timing_log_emit("perf_nqd", _buf);
+	}
 	nqd_blit_accel = nqd_blit_reject = nqd_blit_to_screen = 0;
 	nqd_fill_accel = nqd_fill_reject = nqd_unknown = 0;
 	for (int m = 0; m < 64; m++) nqd_reject_mode[m] = 0;

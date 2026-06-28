@@ -43,18 +43,26 @@
 #ifdef SHEEPSHAVER
 #include "timer.h"
 #include "prefs.h"
+#include "timing_log.h"
 
 // Lightweight, pref-gated JIT throughput counters ("perf_profile").  When the
 // flag is false (default) the increments are a single predicted branch, and the
 // periodic report is skipped, so this is safe to leave compiled in.
 static bool   ppc_perf_profile = false;
 static bool   ppc_perf_profile_init = false;
-static uint64 ppc_perf_blocks = 0;			// JIT blocks dispatched
+uint64 ppc_perf_blocks = 0;				// JIT blocks dispatched
 static uint64 ppc_perf_compiles = 0;		// new blocks compiled
 static uint64 ppc_perf_misses = 0;			// fast-cache lookup misses
 static uint64 ppc_perf_spc_exits = 0;		// block exits with pending spcflags
 static uint64 ppc_perf_irqs = 0;			// interrupts handled
 static uint64 ppc_perf_window_start = 0;
+
+void ppc_perf_reset(void)
+{
+	ppc_perf_blocks = ppc_perf_compiles = ppc_perf_misses = 0;
+	ppc_perf_spc_exits = ppc_perf_irqs = 0;
+	ppc_perf_window_start = 0;
+}
 
 static void ppc_perf_maybe_report(void)
 {
@@ -78,6 +86,20 @@ static void ppc_perf_maybe_report(void)
 		   (unsigned long long)ppc_perf_spc_exits,
 		   (unsigned long long)ppc_perf_irqs, ppc_perf_irqs / secs);
 	fflush(stdout);
+	if (timing_log_active) {
+		char _buf[256];
+		snprintf(_buf, sizeof(_buf),
+			"\"elapsed_s\":%.3f,\"blocks_M\":%.3f,\"blocks_Ms\":%.3f,"
+			"\"compiles\":%llu,\"misses\":%llu,\"spc_exits\":%llu,"
+			"\"irqs\":%llu,\"irqs_s\":%.2f",
+			secs,
+			ppc_perf_blocks / 1e6, ppc_perf_blocks / secs / 1e6,
+			(unsigned long long)ppc_perf_compiles,
+			(unsigned long long)ppc_perf_misses,
+			(unsigned long long)ppc_perf_spc_exits,
+			(unsigned long long)ppc_perf_irqs, ppc_perf_irqs / secs);
+		timing_log_emit("perf_jit", _buf);
+	}
 	ppc_perf_blocks = ppc_perf_compiles = ppc_perf_misses = 0;
 	ppc_perf_spc_exits = ppc_perf_irqs = 0;
 	ppc_perf_window_start = now;

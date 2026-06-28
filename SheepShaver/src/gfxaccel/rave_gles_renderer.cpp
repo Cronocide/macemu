@@ -26,6 +26,7 @@
 
 #include "sysdeps.h"
 #include "cpu_emulation.h"
+#include "timing_log.h"
 #include "rave_engine.h"
 #include "rave_metal_renderer.h"
 #include "gles_compositor.h"
@@ -118,6 +119,21 @@ static void rave_perf_report(void)
 	       rave_perf_readback_us / 1000.0 / f,
 	       rave_perf_blit_us / 1000.0 / f);
 	fflush(stdout);
+	if (timing_log_active) {
+		char _buf[256];
+		snprintf(_buf, sizeof(_buf),
+			"\"elapsed_s\":%.3f,\"frames\":%llu,\"fps\":%.2f,"
+			"\"guest_ms\":%.3f,\"draws_ms\":%.3f,\"flush_ms\":%.3f,"
+			"\"readback_ms\":%.3f,\"blit_ms\":%.3f",
+			secs,
+			(unsigned long long)rave_perf_frames, rave_perf_frames / secs,
+			rave_perf_guest_us / 1000.0 / f,
+			rave_perf_dispatch_us / 1000.0 / f,
+			rave_perf_flush_us / 1000.0 / f,
+			rave_perf_readback_us / 1000.0 / f,
+			rave_perf_blit_us / 1000.0 / f);
+		timing_log_emit("perf_rave", _buf);
+	}
 	rave_perf_flush_us = rave_perf_readback_us = rave_perf_blit_us = 0;
 	rave_perf_dispatch_us = rave_perf_guest_us = 0;
 	rave_perf_frames = 0;

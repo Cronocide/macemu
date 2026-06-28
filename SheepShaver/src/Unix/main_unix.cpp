@@ -234,6 +234,8 @@ static EmulatorData *emulator_data;
 
 static uint8 last_xpram[XPRAM_SIZE];		// Buffer for monitoring XPRAM changes
 
+volatile sig_atomic_t screenshot_requested = 0;	// Set by SIGUSR2, cleared by present path
+
 static bool nvram_thread_active = false;	// Flag: NVRAM watchdog installed
 static volatile bool nvram_thread_cancel;	// Flag: Cancel NVRAM thread
 static pthread_t nvram_thread;				// NVRAM watchdog
@@ -704,15 +706,46 @@ static bool install_signal_handlers(void)
 	}
 #endif
 
-	// Install SIGUSR1 handler for diagnostic register dumps
+	// Write PID file so external tools can send SIGUSR1 without a process search.
+	// Path defaults to /tmp/sheepshaver.pid; override with SHEEPSHAVER_PID_FILE.
+	{
+		const char *pid_path = getenv("SHEEPSHAVER_PID_FILE");
+		if (!pid_path || !*pid_path) pid_path = "/tmp/sheepshaver.pid";
+		FILE *pf = fopen(pid_path, "w");
+		if (pf) { fprintf(pf, "%d\n", (int)getpid()); fclose(pf); }
+	}
+
+	// Install SIGUSR1 handler: dumps PPC registers AND resets all perf-counter
+	// windows so the next 2-second report captures exactly the period of interest.
+	// Send with: kill -USR1 $(cat /tmp/sheepshaver.pid)
 	extern void DumpPPCRegisters(void);
+	extern void nqd_blit_diag_reset(void);
+	extern void ppc_perf_reset(void);
+	extern void video_profile_reset(void);
 	struct sigaction sigusr1_action;
 	sigemptyset(&sigusr1_action.sa_mask);
 	sigusr1_action.sa_handler = [](int) {
 		DumpPPCRegisters();
+		nqd_blit_diag_reset();
+		ppc_perf_reset();
+		video_profile_reset();
+		timing_log_emit("capture_mark", NULL);
+		const char msg[] = "[CAPTURE_MARK] perf windows reset\n";
+		(void)write(STDERR_FILENO, msg, sizeof(msg) - 1);
 	};
 	sigusr1_action.sa_flags = 0;
 	sigaction(SIGUSR1, &sigusr1_action, NULL);
+
+	// Install SIGUSR2 handler: request a BMP screenshot on the next present.
+	// Send with: kill -USR2 $(cat /tmp/sheepshaver.pid)
+	// Output path: ${SHEEPSHAVER_SHOT_DIR:-/tmp}/sheepshaver_<timestamp>.bmp
+	struct sigaction sigusr2_action;
+	sigemptyset(&sigusr2_action.sa_mask);
+	sigusr2_action.sa_handler = [](int) {
+		screenshot_requested = 1;
+	};
+	sigusr2_action.sa_flags = 0;
+	sigaction(SIGUSR2, &sigusr2_action, NULL);
 
 	return true;
 }
