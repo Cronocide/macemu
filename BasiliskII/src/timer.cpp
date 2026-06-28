@@ -20,6 +20,7 @@
 
 #include "sysdeps.h"
 #include "timer.h"
+#include "timing_log.h"
 #include "macos_util.h"
 #include "main.h"
 #include "cpu_emulation.h"
@@ -58,6 +59,16 @@ struct TMDesc {
 };
 
 static TMDesc *tmDescList;
+
+// Convert a host time value to absolute microseconds (for instrumentation)
+static inline int64 tm_to_usec(const tm_time_t &t)
+{
+#if defined(HAVE_CLOCK_GETTIME) || defined(__MACH__)
+	return (int64)t.tv_sec * 1000000 + t.tv_nsec / 1000;
+#else
+	return (int64)t.tv_sec * 1000000 + t.tv_usec;
+#endif
+}
 
 #if PRECISE_TIMING
 #ifdef PRECISE_TIMING_BEOS
@@ -581,9 +592,15 @@ static void *timer_func(void *arg)
 #ifdef PRECISE_TIMING_POSIX
 static void *timer_func(void *arg)
 {
+	// Optionally raise scheduling priority / pin (SHEEPSHAVER_RT_TIMER)
+	thread_set_realtime("timer");
+
 	while (!timer_thread_cancel) {
-		// Wait until time specified by wakeup_time
-		clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &wakeup_time, NULL);
+		// Wait until time specified by wakeup_time.
+		// Must match the clock used by timer_current_time() (CLOCK_MONOTONIC),
+		// otherwise the absolute deadline is interpreted against the wrong
+		// timeline and the task fires early or late.
+		clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wakeup_time, NULL);
 
 		tm_time_t system_time;
 		timer_current_time(system_time);
@@ -616,6 +633,10 @@ void TimerInterrupt(void)
 		TMDesc *next = desc->next;
 		uint32 tm = desc->task;
 		if ((ReadMacInt16(tm + qType) & 0x8000) && timer_cmp_time(desc->wakeup, now) <= 0) {
+
+			// Record how late this task fired relative to its scheduled time
+			if (timing_log_active)
+				timing_log_tm(tm_to_usec(desc->wakeup), tm_to_usec(now));
 
 			// Found one, mark as inactive and remove it from the Time Manager queue
 			WriteMacInt16(tm + qType, ReadMacInt16(tm + qType) & 0x7fff);

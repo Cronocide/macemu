@@ -27,6 +27,135 @@
 #define DEBUG 0
 #include "debug.h"
 
+// 3D acceleration hooks (RAVE engine + OpenGL CFM library).  Forward-declared
+// here to avoid pulling gfxaccel/include/rave_engine.h or gl_engine.h into
+// this translation unit (which would also drag in their private state structs).
+extern void RaveRegisterEngine(void);
+extern void GLInstallHooks(void);
+
+// Runtime logging toggles defined in gfxaccel/rave_dispatch.cpp and
+// gfxaccel/gl_dispatch.cpp.  When the gfxaccel logging master is compiled
+// out (ACCEL_LOGGING_ENABLED=0) these symbols are not provided, so the prefs
+// wiring below is gated on the same flag.
+#include "accel_logging.h"
+#if ACCEL_LOGGING_ENABLED
+extern bool rave_logging_enabled;
+extern bool gl_logging_enabled;
+#endif
+
+/*
+ *  NQD blit diagnostics ("nqd_diag" pref, defined in the SDL video backend).
+ *  All NQD hooks run on the single emulation thread, so the counters below need
+ *  no locking.  We aggregate per-2s windows and emit a [nqd:blit] summary plus a
+ *  rate-limited sample of the most recent screen-targeted bitblt's geometry so
+ *  the on-screen destination coordinates can be checked against where content
+ *  actually appears (e.g. the reported ~10px horizontal shift).
+ */
+extern bool nqd_diag_enabled;
+
+static uint64 nqd_blit_window_start = 0;
+static uint64 nqd_blit_accel = 0;			// bitblts accelerated (srcCopy native path)
+static uint64 nqd_blit_reject = 0;			// bitblts rejected (fell back to guest CPU)
+static uint64 nqd_blit_to_screen = 0;		// blits whose dest is the live screen
+static uint64 nqd_fill_accel = 0;			// fills/inverts accelerated
+static uint64 nqd_fill_reject = 0;
+static uint64 nqd_unknown = 0;				// ACCL_BLTMASK/FILLMASK/etc (never accelerated)
+static uint64 nqd_reject_mode[64] = {0};	// rejected-bitblt count by transfer mode (0..63)
+// Last screen-targeted bitblt sample (for geometry inspection)
+static int nqd_last_kind = -1;				// 0=accel bitblt, 1=reject bitblt
+static int nqd_last_dx=0, nqd_last_dy=0, nqd_last_w=0, nqd_last_h=0;
+static int nqd_last_dbnd_l=0, nqd_last_dbnd_t=0, nqd_last_drb=0, nqd_last_mode=0, nqd_last_bpp=0;
+
+static void nqd_blit_diag_report(void)
+{
+	if (!nqd_diag_enabled)
+		return;
+	const uint64 now = GetTicks_usec();
+	if (nqd_blit_window_start == 0) {
+		nqd_blit_window_start = now;
+		return;
+	}
+	const uint64 elapsed = now - nqd_blit_window_start;
+	if (elapsed < 2000000)
+		return;
+	// Build a compact list of the rejected-bitblt transfer modes seen
+	char modes[128]; int mp = 0; modes[0] = 0;
+	for (int m = 0; m < 64 && mp < (int)sizeof(modes) - 16; m++) {
+		if (nqd_reject_mode[m])
+			mp += snprintf(modes + mp, sizeof(modes) - mp, "%s%d:%llu",
+						   mp ? "," : "", m, (unsigned long long)nqd_reject_mode[m]);
+	}
+	printf("[nqd:blit] %.2fs | bitblt accel %llu reject %llu (to_screen %llu) | "
+		   "fill accel %llu reject %llu | unknown(masked) %llu | reject_modes[%s]\n",
+		   elapsed / 1000000.0,
+		   (unsigned long long)nqd_blit_accel,
+		   (unsigned long long)nqd_blit_reject,
+		   (unsigned long long)nqd_blit_to_screen,
+		   (unsigned long long)nqd_fill_accel,
+		   (unsigned long long)nqd_fill_reject,
+		   (unsigned long long)nqd_unknown,
+		   modes);
+	if (nqd_last_kind >= 0)
+		printf("[nqd:blit]   last screen bitblt %s: dst(%d,%d) %dx%d destBounds(l=%d,t=%d) rowBytes=%d mode=%d bpp=%d\n",
+			   nqd_last_kind == 0 ? "ACCEL" : "REJECT",
+			   nqd_last_dx, nqd_last_dy, nqd_last_w, nqd_last_h,
+			   nqd_last_dbnd_l, nqd_last_dbnd_t, nqd_last_drb, nqd_last_mode, nqd_last_bpp);
+	fflush(stdout);
+	nqd_blit_accel = nqd_blit_reject = nqd_blit_to_screen = 0;
+	nqd_fill_accel = nqd_fill_reject = nqd_unknown = 0;
+	for (int m = 0; m < 64; m++) nqd_reject_mode[m] = 0;
+	nqd_last_kind = -1;
+	nqd_blit_window_start = now;
+}
+
+// Capture the geometry of a screen-targeted bitblt for the periodic sample line.
+static void nqd_blit_diag_sample(uint32 p, int kind)
+{
+	nqd_last_kind = kind;
+	nqd_last_dx = (int16)ReadMacInt16(p + acclDestRect + 2) - (int16)ReadMacInt16(p + acclDestBoundsRect + 2);
+	nqd_last_dy = (int16)ReadMacInt16(p + acclDestRect + 0) - (int16)ReadMacInt16(p + acclDestBoundsRect + 0);
+	nqd_last_w  = (int16)ReadMacInt16(p + acclDestRect + 6) - (int16)ReadMacInt16(p + acclDestRect + 2);
+	nqd_last_h  = (int16)ReadMacInt16(p + acclDestRect + 4) - (int16)ReadMacInt16(p + acclDestRect + 0);
+	nqd_last_dbnd_l = (int16)ReadMacInt16(p + acclDestBoundsRect + 2);
+	nqd_last_dbnd_t = (int16)ReadMacInt16(p + acclDestBoundsRect + 0);
+	nqd_last_drb = (int32)ReadMacInt32(p + acclDestRowBytes);
+	nqd_last_mode = (int32)ReadMacInt32(p + acclTransferMode);
+	nqd_last_bpp = (int32)ReadMacInt32(p + acclDestPixelSize);
+}
+
+/*
+ *  Phase B stub for the RAVE display-clear hook used by NativeHookDrawContextDelete
+ *  in gfxaccel/rave_engine.cpp.  In Phase C the compositor-aware video_sdl2.cpp
+ *  provides the real (non-weak) definition that drops the RAVE overlay slot
+ *  via gles_compositor_clear_overlay; until then a no-op is correct because
+ *  no GPU overlay is registered while the renderer is stubbed out.
+ */
+extern "C" __attribute__((weak)) void video_clear_rave_display(void)
+{
+}
+
+/*
+ *  Phase C weak no-op for the RAVE/GL CPU-readback compositing fallback.
+ *  Renderers only call this when they took the readback path; the GLES
+ *  compositor's GPU overlay path is primary and skips this.  Per-title
+ *  needs (e.g. QuickDraw menus over 3D content) can override it from the
+ *  SDL backend with a real RGBA->framebuffer blit.
+ */
+extern "C" __attribute__((weak)) void video_blit_rave_fbo(const uint8 *,
+                                                          int, int,
+                                                          int, int)
+{
+}
+
+/*
+ *  Weak no-op for overlay placement registration. The SDL backend can
+ *  override this with a real implementation once it tracks RAVE overlay
+ *  geometry for framebuffer clear/readback paths.
+ */
+extern "C" __attribute__((weak)) void video_set_rave_display(unsigned int, int, int, int, int)
+{
+}
+
 
 /*
  *	Utility functions
@@ -302,14 +431,17 @@ bool NQD_fillrect_hook(uint32 p)
 		if (transfer_mode == 8) {
 			// Fill
 			WriteMacInt32(p + acclDrawProc, NativeTVECT(NATIVE_NQD_FILLRECT));
+			if (nqd_diag_enabled) { nqd_fill_accel++; nqd_blit_diag_report(); }
 			return true;
 		}
 		else if (transfer_mode == 10) {
 			// Invert
 			WriteMacInt32(p + acclDrawProc, NativeTVECT(NATIVE_NQD_INVRECT));
+			if (nqd_diag_enabled) { nqd_fill_accel++; nqd_blit_diag_report(); }
 			return true;
 		}
 	}
+	if (nqd_diag_enabled) { nqd_fill_reject++; nqd_blit_diag_report(); }
 	return false;
 }
 
@@ -386,6 +518,8 @@ bool NQD_bitblt_hook(uint32 p)
 	D(bug("accl_draw_hook %08x\n", p));
 	NQD_set_dirty_area(p);
 
+	const bool to_screen = (ReadMacInt32(p + acclDestBaseAddr) == screen_base);
+
 	// Check if we can accelerate this bitblt
 	if (ReadMacInt32(p + 0x018) + ReadMacInt32(p + 0x128) == 0 &&
 		ReadMacInt32(p + 0x130) == 0 &&
@@ -397,7 +531,19 @@ bool NQD_bitblt_hook(uint32 p)
 
 		// Yes, set function pointer
 		WriteMacInt32(p + acclDrawProc, NativeTVECT(NATIVE_NQD_BITBLT));
+		if (nqd_diag_enabled) {
+			nqd_blit_accel++;
+			if (to_screen) { nqd_blit_to_screen++; nqd_blit_diag_sample(p, 0); }
+			nqd_blit_diag_report();
+		}
 		return true;
+	}
+	if (nqd_diag_enabled) {
+		nqd_blit_reject++;
+		const int mode = (int)ReadMacInt32(p + acclTransferMode);
+		if (mode >= 0 && mode < 64) nqd_reject_mode[mode]++;
+		if (to_screen) { nqd_blit_to_screen++; nqd_blit_diag_sample(p, 1); }
+		nqd_blit_diag_report();
 	}
 	return false;
 }
@@ -408,6 +554,10 @@ bool NQD_unknown_hook(uint32 arg)
 	D(bug("accl_unknown_hook %08x\n", arg));
 	NQD_set_dirty_area(arg);
 
+	if (nqd_diag_enabled) {
+		nqd_unknown++;
+		nqd_blit_diag_report();
+	}
 	return false;
 }
 
@@ -457,5 +607,33 @@ void VideoInstallAccel(void)
 			WriteMacInt32(base + 8, op);
 			NQDMisc(6, unknown_hook_info.addr());
 		}
+	}
+
+	// Install 3D acceleration (RAVE engine + OpenGL CFM).  Independent of
+	// the 2D `gfxaccel` switch above: a user may want software QuickDraw
+	// acceleration disabled while still using the GPU 3D path, or vice
+	// versa.  RaveRegisterEngine() is re-entrancy-safe and keeps retrying
+	// across PatchAfterStartup ticks until the RAVE manager fragment is
+	// loaded, so calling it from here is sufficient.
+	//
+	// Fallback safety: if `gfx_accel` is false, none of the hooks are
+	// installed -- the guest's RAVE manager enumeration sees only its
+	// built-in software engine, the OpenGL CFM library is left untouched,
+	// and the GLES compositor never registers an overlay (so
+	// present_sdl_video() takes the pure SDL_Renderer 2D path).
+	// Setting `gfx_accel=false` is the documented escape hatch when a
+	// title regresses on the 3D path.
+	if (PrefsFindBool("gfx_accel")) {
+#if ACCEL_LOGGING_ENABLED
+		bool log = PrefsFindBool("gfx_accel_log");
+		rave_logging_enabled = log;
+		gl_logging_enabled = log;
+#endif
+		D(bug("Video: Registering 3D acceleration engine\n"));
+		RaveRegisterEngine();
+		// Install OpenGL CFM library symbol-lookup hooks so guest GL calls
+		// land in our dispatch.  Idempotent + retry-safe like RaveRegisterEngine,
+		// so it's correct to call from this same accRun-driven entry point.
+		GLInstallHooks();
 	}
 }

@@ -74,6 +74,12 @@ extern bool audio_open;					// Flag: audio is open and ready
 extern int audio_frames_per_block;		// Number of audio frames per block
 extern uint32 audio_component_flags;	// Component feature flags
 
+// Authoritative media clock: total audio frames actually handed to the host
+// output device. This advances at the true playback rate (the device drains
+// samples at a fixed rate), so it is a jitter-free reference for audio-locked
+// timing, independent of the host wall/monotonic clocks.
+extern volatile uint64 audio_sample_clock;
+
 extern vector<uint32> audio_sample_rates;	// Vector of supported sample rates (16.16 fixed point)
 extern vector<uint16> audio_sample_sizes;	// Vector of supported sample sizes
 extern vector<uint8> audio_channel_counts;	// Array of supported channels counts

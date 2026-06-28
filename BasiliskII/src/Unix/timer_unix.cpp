@@ -32,6 +32,15 @@
 #define CLOCK_REALTIME 0
 #endif
 
+// Use a monotonic clock for all emulated timing (Time Manager, mftb-derived
+// Time Base, Microseconds, 60Hz tick). CLOCK_REALTIME is stepped by NTP and
+// suspend/resume on handhelds like the H700, which makes absolute timer waits
+// fire early/late. CLOCK_MONOTONIC never jumps. The wall-clock calendar
+// (TimerDateTime) deliberately still uses time()/CLOCK_REALTIME.
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC CLOCK_REALTIME
+#endif
+
 #if defined(__MACH__)
 #include <mach/mach.h>
 #include <mach/clock.h>
@@ -107,7 +116,7 @@ void timer_current_time(tm_time_t &t)
 #if defined(__MACH__)
 	mach_current_time(t);
 #elif defined(HAVE_CLOCK_GETTIME)
-	clock_gettime(CLOCK_REALTIME, &t);
+	clock_gettime(CLOCK_MONOTONIC, &t);
 #else
 	gettimeofday(&t, NULL);
 #endif
@@ -248,12 +257,38 @@ uint64 GetTicks_usec(void)
 	return (uint64)t.tv_sec * 1000000 + t.tv_nsec / 1000;
 #elif defined(HAVE_CLOCK_GETTIME)
 	struct timespec t;
-	clock_gettime(CLOCK_REALTIME, &t);
+	clock_gettime(CLOCK_MONOTONIC, &t);
 	return (uint64)t.tv_sec * 1000000 + t.tv_nsec / 1000;
 #else
 	struct timeval t;
 	gettimeofday(&t, NULL);
 	return (uint64)t.tv_sec * 1000000 + t.tv_usec;
+#endif
+}
+
+
+/*
+ *  Get current value of nanosecond timer
+ *
+ *  Used to derive the emulated PowerPC Time Base (mftb) at full resolution.
+ *  Scaling microseconds up to a multi-MHz Time Base quantizes it into large
+ *  stairsteps; nanoseconds let the Time Base advance smoothly.
+ */
+
+uint64 GetTicks_nsec(void)
+{
+#if defined(__MACH__)
+	tm_time_t t;
+	mach_current_time(t);
+	return (uint64)t.tv_sec * 1000000000ULL + (uint64)t.tv_nsec;
+#elif defined(HAVE_CLOCK_GETTIME)
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (uint64)t.tv_sec * 1000000000ULL + (uint64)t.tv_nsec;
+#else
+	struct timeval t;
+	gettimeofday(&t, NULL);
+	return (uint64)t.tv_sec * 1000000000ULL + (uint64)t.tv_usec * 1000ULL;
 #endif
 }
 

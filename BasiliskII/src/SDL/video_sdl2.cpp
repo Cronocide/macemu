@@ -70,6 +70,8 @@
 #include "video_blit.h"
 #include "vm_alloc.h"
 #include "cdrom.h"
+#include "gles_compositor.h"
+#include "video_profile.h"
 
 #define DEBUG 0
 #include "debug.h"
@@ -116,6 +118,54 @@ static uint8 *the_buffer = NULL;					// Mac frame buffer (where MacOS draws into
 static uint8 *the_buffer_copy = NULL;				// Copy of Mac frame buffer (for refreshed modes)
 static uint32 the_buffer_size;						// Size of allocated the_buffer
 
+// Performance profiling (see video_profile.h); enabled by the "perf_profile" pref
+bool video_profile_enabled = false;
+VideoProfileCounters video_profile = {};
+
+void video_profile_frame_end(void)
+{
+	if (!video_profile_enabled)
+		return;
+	video_profile.present_frames++;
+	const uint64 now = GetTicks_usec();
+	if (video_profile.window_start_usec == 0) {
+		video_profile.window_start_usec = now;
+		return;
+	}
+	const uint64 elapsed = now - video_profile.window_start_usec;
+	if (elapsed < 2000000)							// report roughly every 2 seconds
+		return;
+
+	const double secs = elapsed / 1000000.0;
+	uint64 total_usec = 0;
+	for (int i = 0; i < VPROF_PHASE_COUNT; i++)
+		total_usec += video_profile.phase_usec[i];
+
+	printf("[perf:video] %.2fs | %llu presents (%.1f/s) | dirty %llu boxes %.2f Mpx | "
+		   "scan %llums conv %llums upload %llums render %llums | pipeline %.1f%% busy\n",
+		   secs,
+		   (unsigned long long)video_profile.present_frames,
+		   video_profile.present_frames / secs,
+		   (unsigned long long)video_profile.dirty_boxes,
+		   video_profile.dirty_pixels / 1000000.0,
+		   (unsigned long long)(video_profile.phase_usec[VPROF_SCAN] / 1000),
+		   (unsigned long long)(video_profile.phase_usec[VPROF_CONVERT] / 1000),
+		   (unsigned long long)(video_profile.phase_usec[VPROF_UPLOAD] / 1000),
+		   (unsigned long long)(video_profile.phase_usec[VPROF_RENDER] / 1000),
+		   100.0 * total_usec / (double)elapsed);
+	fflush(stdout);
+
+	// Reset window
+	for (int i = 0; i < VPROF_PHASE_COUNT; i++) {
+		video_profile.phase_usec[i] = 0;
+		video_profile.phase_calls[i] = 0;
+	}
+	video_profile.dirty_boxes = 0;
+	video_profile.dirty_pixels = 0;
+	video_profile.present_frames = 0;
+	video_profile.window_start_usec = now;
+}
+
 static bool redraw_thread_active = false;			// Flag: Redraw thread installed
 #ifndef USE_CPU_EMUL_SERVICES
 static volatile bool redraw_thread_cancel;			// Flag: Cancel Redraw thread
@@ -151,6 +201,70 @@ static SDL_threadID sdl_renderer_thread_id = 0;		// Thread ID where the SDL_rend
 static SDL_Texture * sdl_texture = NULL;			// Handle to a GPU texture, with which to draw guest_surface to
 static SDL_Rect sdl_update_video_rect = {0,0,0,0};  // Union of all rects to update, when updating sdl_texture
 static SDL_mutex * sdl_update_video_mutex = NULL;   // Mutex to protect sdl_update_video_rect
+static int sdl_logical_w = 0, sdl_logical_h = 0;	// Renderer logical size (== Mac mode dimensions)
+
+// NQD (QuickDraw acceleration) dirty-region tracking for the non-VOSF refresh
+// path.  Accelerated blits/fills report exactly which rectangle they touched via
+// video_set_dirty_area(), letting the redraw thread scan only that region rather
+// than memcmp'ing the whole framebuffer every pass.  A full scan is still forced
+// periodically so direct (non-accelerated) framebuffer writers are not missed.
+static bool nqd_dirty_tracking = true;				// "nqd_dirty" pref
+static const uint32 NQD_FULL_SCAN_INTERVAL = 8;		// force a full scan every N passes
+static SDL_Rect nqd_dirty_rect = {0,0,0,0};			// accumulated dirty bbox (union)
+static bool nqd_dirty_valid = false;				// is nqd_dirty_rect populated?
+static SDL_mutex * nqd_dirty_mutex = NULL;			// protects nqd_dirty_rect/valid
+static volatile uint64 nqd_hint_seen_usec = 0;		// time of last NQD dirty hint
+
+// QuickDraw accel diagnostics ("nqd_diag" pref).  Measures the partial-frame
+// hypothesis directly: on every limited (NQD-bbox) scan pass we additionally
+// count how many pixels differ between the_buffer and the_buffer_copy OUTSIDE
+// the scanned window.  Those are guest pixels already written this frame that
+// will NOT be uploaded until a later present -- i.e. a region tearing/lagging
+// behind the rest of the frame.  Reported as a rolling [nqd:diag] summary.
+// Shared with gfxaccel.cpp, which reports blit params under the same flag.
+bool nqd_diag_enabled = false;
+// Diagnostic: force a full-framebuffer upload on every present.  This removes all
+// partial-frame deferral (region lag) so its visual effect can be A/B tested
+// against the default incremental upload.  Pref "present_full".
+static bool present_full_enabled = false;
+static uint64 nqd_diag_window_start = 0;
+static uint64 nqd_diag_passes = 0;			// scan passes in window
+static uint64 nqd_diag_limited = 0;			// passes that scanned only the NQD bbox
+static uint64 nqd_diag_full = 0;			// passes that scanned the whole screen
+static uint64 nqd_diag_deferred_boxes = 0;	// 64px tiles dirty but outside the scan window
+static uint64 nqd_diag_deferred_px = 0;		// pixels dirty but outside the scan window
+static uint64 nqd_diag_deferred_passes = 0;	// limited passes that deferred >=1 tile
+static uint64 nqd_diag_union_w_sum = 0;		// for mean NQD union size
+static uint64 nqd_diag_union_h_sum = 0;
+static uint64 nqd_diag_union_n = 0;
+
+// Present-level diagnostic (path-agnostic, works under VOSF too).  A shadow of
+// what the GPU texture currently shows lets us count, at each present, the
+// pixels of the_buffer that differ from the displayed texture but lie OUTSIDE
+// the region being uploaded this present.  Those are guest pixels already
+// written but not shown until a later present -- i.e. a region tearing/lagging
+// behind the rest of the frame, the direct signature of the artifacts.
+static uint8 *nqd_diag_shadow = NULL;
+static size_t nqd_diag_shadow_size = 0;
+static uint64 nqd_diag_presents = 0;		// presents measured in window
+static uint64 nqd_diag_present_deferred = 0;// presents that left >=1 tile deferred
+static uint64 nqd_diag_pdef_tiles = 0;		// deferred 64px tiles (sum over presents)
+static uint64 nqd_diag_pdef_px = 0;			// deferred pixels (sum over presents)
+static uint64 nqd_diag_upload_px = 0;		// pixels uploaded (sum over presents)
+static void nqd_diag_present(const SDL_Rect &up);	// defined below, called from present_sdl_video
+
+// GPU present path ("video_gpu_present"): convert/scale the 2D framebuffer on
+// the GPU via a GLES shader instead of CPU SDL_BlitSurface + SDL_RenderCopy.
+static bool gpu_present_pref = false;				// pref value (read at VideoInit)
+static bool gpu_present_active = false;				// pref on AND mode is GPU-supported
+static int  gpu_present_pitch = 0;					// the_buffer row stride (bytes)
+
+// Optional cap on how often the present runs on the emulation thread.  present
+// is driven by the 60 Hz Mac VBL interrupt, so a slow GPU present steals CPU
+// from emulation.  Capping the rate (pref "present_hz", 0 = uncapped) trades
+// display refresh rate for emulation throughput on CPU-bound games.  Deferred
+// presents are harmless: the dirty rectangle simply persists until next time.
+static uint32 present_min_interval_usec = 0;
 static int screen_depth;							// Depth of current screen
 #ifdef SHEEPSHAVER
 static SDL_Cursor *sdl_cursor = NULL;				// Copy of Mac cursor
@@ -709,6 +823,13 @@ static void delete_sdl_video_window()
 static void shutdown_sdl_video()
 {
 	delete_sdl_video_surfaces();
+	if (gpu_present_active || gpu_present_pref) {
+		gles_gl_lock();
+		gles_present_shutdown();
+		gles_gl_unlock();
+	}
+	gpu_present_active = false;
+	gles_compositor_shutdown();
 	delete_sdl_video_window();
 }
 
@@ -796,7 +917,8 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 #elif defined(__MACOSX__) && SDL_VERSION_ATLEAST(2,0,14)
 			SDL_SetHint(SDL_HINT_RENDER_DRIVER, window_flags & SDL_WINDOW_METAL ? "metal" : "opengl");
 #else
-			SDL_SetHint(SDL_HINT_RENDER_DRIVER, "");
+			// Force OpenGL renderer so the GLES compositor shares the same GL context
+			SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
 #endif
 	    }
 
@@ -817,6 +939,11 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 		memset(&info, 0, sizeof(info));
 		SDL_GetRendererInfo(sdl_renderer, &info);
 		printf("Using SDL_Renderer driver: %s\n", (info.name ? info.name : "(null)"));
+
+		// Initialize GLES compositor (blit shader + VBO) for 3D overlay compositing
+		if (gles_compositor_init() != 0) {
+			printf("Warning: GLES compositor init failed — 3D overlays disabled\n");
+		}
 	}
     
     if (!sdl_update_video_mutex) {
@@ -903,8 +1030,35 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 		shutdown_sdl_video();
 		return NULL;
 	}
+	sdl_logical_w = width;
+	sdl_logical_h = height;
 
 	SDL_RenderSetIntegerScale(sdl_renderer, PrefsFindBool("scale_integer") ? SDL_TRUE : SDL_FALSE);
+
+	// Optionally enable the GPU present path for the depths where it removes
+	// real CPU conversion cost (8-bit palette expansion, 16-bit blit).  32-bit
+	// already wraps the_buffer directly with no conversion, so it stays on the
+	// SDL path.  Falls back silently to the SDL path if init fails.
+	gpu_present_active = false;
+	if (gpu_present_pref) {
+		int bits = 0;
+		if (depth == VIDEO_DEPTH_8BIT) bits = 8;
+		else if (depth == VIDEO_DEPTH_16BIT) bits = 16;
+		if (bits && gles_present_supported(bits)) {
+			const int intscale = PrefsFindBool("scale_integer") ? 1 : 0;
+			gles_gl_lock();
+			const int rc = gles_present_init(bits, width, height, intscale);
+			gles_gl_unlock();
+			if (rc == 0) {
+				gpu_present_active = true;
+				gpu_present_pitch = pitch;
+				printf("GPU present path active (%d-bit, %dx%d, pitch=%d)\n",
+					   bits, width, height, pitch);
+			} else {
+				printf("GPU present init failed; using SDL present path\n");
+			}
+		}
+	}
 
     return guest_surface;
 }
@@ -918,6 +1072,16 @@ static int present_sdl_video()
 		return -1;
 	}
 
+	// Optional present-rate cap: defer this present (the dirty rect is kept) if
+	// the previous one ran too recently, bounding emulation-thread present cost.
+	if (present_min_interval_usec) {
+		static uint64 last_present_usec = 0;
+		const uint64 now = GetTicks_usec();
+		if (last_present_usec != 0 && now - last_present_usec < present_min_interval_usec)
+			return 0;
+		last_present_usec = now;
+	}
+
 	// Some systems, such as D3D9, can fail if and when they are used across
 	// certain operations.  To address this, only utilize SDL_Renderer in a
 	// single thread, preferably the main thread.
@@ -926,22 +1090,114 @@ static int present_sdl_video()
 	// "BasiliskII, Win32: resizing a window does not stretch "
 	SDL_assert(SDL_ThreadID() == sdl_renderer_thread_id);
 
-	// Make sure the display's internal (to SDL, possibly the OS) buffer gets
-	// cleared.  Not doing so can, if and when letterboxing is applied (whereby
-	// colored bars are drawn on the screen's sides to help with aspect-ratio
-	// correction), the colored bars can be an unknown color.
-	SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 0);	// Use black
-	SDL_RenderClear(sdl_renderer);						// Clear the display
-	
+	uint64 t0 = video_profile_enabled ? GetTicks_usec() : 0;
+
+	// The letterbox bars (drawn when the window aspect differs from the Mac
+	// mode) only need clearing when they actually exist.  When the Mac mode
+	// fills the whole output exactly -- the common H700 case where the panel
+	// resolution matches the video mode -- the full-screen copy below
+	// overwrites every pixel, so clearing each frame is pure waste on the
+	// Mali-G31.  We recompute this only when the output size changes.
+	int out_w = 0, out_h = 0;
+	SDL_GetRendererOutputSize(sdl_renderer, &out_w, &out_h);
+	bool needs_clear;
+	{
+		static int last_out_w = -1, last_out_h = -1;
+		static bool cached_needs_clear = true;
+		if (out_w != last_out_w || out_h != last_out_h) {
+			last_out_w = out_w;
+			last_out_h = out_h;
+			cached_needs_clear = true;
+			if (sdl_logical_w > 0 && sdl_logical_h > 0 && out_w > 0 && out_h > 0) {
+				double scale = (double)out_w / sdl_logical_w;
+				const double sy = (double)out_h / sdl_logical_h;
+				if (sy < scale) scale = sy;
+				SDL_bool integer_scale = SDL_RenderGetIntegerScale(sdl_renderer);
+				if (integer_scale) scale = (scale < 1.0) ? 1.0 : (double)(int)scale;
+				const int filled_w = (int)(scale * sdl_logical_w + 0.5);
+				const int filled_h = (int)(scale * sdl_logical_h + 0.5);
+				cached_needs_clear = (filled_w < out_w) || (filled_h < out_h);
+			}
+		}
+		needs_clear = cached_needs_clear;
+	}
+
+	// --- GPU present path: upload the raw framebuffer and convert in-shader ---
+	if (gpu_present_active) {
+		// Acquire the shared GL lock without blocking.  A RAVE render holds
+		// this lock across NativeRenderStart..NativeRenderEnd (spanning guest
+		// execution and VBL interrupts); since present runs on the same thread
+		// via the VBL interrupt, a blocking lock would self-deadlock.  If the
+		// lock is busy, defer this present -- the dirty rect is left intact and
+		// the frame is shown on a later VBL once the RAVE render finishes.
+		if (gles_gl_trylock() != 0)
+			return 0;
+
+		SDL_Rect r;
+		SDL_LockMutex(sdl_update_video_mutex);
+		r = sdl_update_video_rect;
+		if (video_profile_enabled)
+			video_profile_note_dirty(1, (uint64)r.w * r.h);
+		sdl_update_video_rect.x = sdl_update_video_rect.y = 0;
+		sdl_update_video_rect.w = sdl_update_video_rect.h = 0;
+		SDL_UnlockMutex(sdl_update_video_mutex);
+
+		// Diagnostic: upload the entire framebuffer instead of the dirty rect.
+		if (present_full_enabled && drv) {
+			const VIDEO_MODE &mode = drv->mode;
+			r.x = 0; r.y = 0; r.w = VIDEO_MODE_X; r.h = VIDEO_MODE_Y;
+		}
+
+		if (nqd_diag_enabled)
+			nqd_diag_present(r);
+
+		{
+			VideoProfileScope _up(VPROF_UPLOAD);
+			gles_present_upload(the_buffer, gpu_present_pitch, r.x, r.y, r.w, r.h);
+		}
+		uint64 t_render_gpu = video_profile_enabled ? GetTicks_usec() : 0;
+		gles_present_draw(out_w, out_h, needs_clear ? 1 : 0);
+		if (gles_compositor_has_overlay())
+			gles_compositor_composite_overlays(out_w, out_h);
+		gles_gl_unlock();
+
+		SDL_RenderPresent(sdl_renderer);
+		if (video_profile_enabled) {
+			video_profile_add(VPROF_RENDER, GetTicks_usec() - t_render_gpu);
+			video_profile_frame_end();
+		}
+		return 0;
+	}
+
+	// --- SDL present path ---
+	if (needs_clear) {
+		SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 0);	// Use black
+		SDL_RenderClear(sdl_renderer);						// Clear letterbox bars
+	}
+	if (video_profile_enabled) { video_profile_add(VPROF_RENDER, GetTicks_usec() - t0); }
+
 	// We're about to work with sdl_update_video_rect, so stop other threads from
 	// modifying it!
 	LOCK_PALETTE;
 	SDL_LockMutex(sdl_update_video_mutex);
+
+	// Diagnostic: convert/upload the entire framebuffer instead of the dirty rect.
+	if (present_full_enabled && drv) {
+		const VIDEO_MODE &mode = drv->mode;
+		sdl_update_video_rect.x = 0; sdl_update_video_rect.y = 0;
+		sdl_update_video_rect.w = VIDEO_MODE_X; sdl_update_video_rect.h = VIDEO_MODE_Y;
+	}
+
+	// Record dirty-region size for profiling before it is consumed/reset.
+	if (video_profile_enabled)
+		video_profile_note_dirty(1, (uint64)sdl_update_video_rect.w * sdl_update_video_rect.h);
+
     // Convert from the guest OS' pixel format, to the host OS' texture, if necessary.
     if (host_surface != guest_surface &&
 		host_surface != NULL &&
 		guest_surface != NULL)
 	{
+		VideoProfileScope _conv(VPROF_CONVERT);
 		SDL_Rect destRect = sdl_update_video_rect;
 		int result = SDL_BlitSurface(guest_surface, &sdl_update_video_rect, host_surface, &destRect);
 		if (result != 0) {
@@ -952,40 +1208,62 @@ static int present_sdl_video()
 	}
 	UNLOCK_PALETTE; // passed potential deadlock, can unlock palette
 	
-    // Update the host OS' texture
-	uint8_t *srcPixels = (uint8_t *)host_surface->pixels +
-		sdl_update_video_rect.y * host_surface->pitch +
-		sdl_update_video_rect.x * host_surface->format->BytesPerPixel;
-
-	uint8_t *dstPixels;
-	int dstPitch;
-	if (SDL_LockTexture(sdl_texture, &sdl_update_video_rect, (void **)&dstPixels, &dstPitch) < 0) {
-		SDL_UnlockMutex(sdl_update_video_mutex);
-		return -1;
+    // Update the host OS' texture, copying only the dirty sub-rectangle.
+    // SDL_UpdateTexture issues a single glTexSubImage2D on the GLES backend,
+    // avoiding the staging-buffer lock/unlock round-trip of SDL_LockTexture.
+	{
+		VideoProfileScope _up(VPROF_UPLOAD);
+		const uint8_t *srcPixels = (const uint8_t *)host_surface->pixels +
+			sdl_update_video_rect.y * host_surface->pitch +
+			sdl_update_video_rect.x * host_surface->format->BytesPerPixel;
+		if (SDL_UpdateTexture(sdl_texture, &sdl_update_video_rect,
+							  srcPixels, host_surface->pitch) < 0) {
+			SDL_UnlockMutex(sdl_update_video_mutex);
+			return -1;
+		}
 	}
-	for (int y = 0; y < sdl_update_video_rect.h; y++) {
-		memcpy(dstPixels, srcPixels, sdl_update_video_rect.w << 2);
-		srcPixels += host_surface->pitch;
-		dstPixels += dstPitch;
-	}
-	SDL_UnlockTexture(sdl_texture);
 
     // We are done working with pixels in host_surface.  Reset sdl_update_video_rect, then let
     // other threads modify it, as-needed.
+    SDL_Rect nqd_diag_uploaded = sdl_update_video_rect;
     sdl_update_video_rect.x = 0;
     sdl_update_video_rect.y = 0;
     sdl_update_video_rect.w = 0;
     sdl_update_video_rect.h = 0;
     SDL_UnlockMutex(sdl_update_video_mutex);
 
-    // Copy the texture to the display
+    if (nqd_diag_enabled)
+        nqd_diag_present(nqd_diag_uploaded);
+
+	uint64 t_render = video_profile_enabled ? GetTicks_usec() : 0;
+
+    // Copy the whole texture to the display.  This must stay a full-frame copy:
+    // SDL_RenderPresent flips a double-buffered swapchain, so the previous
+    // frame's contents in the back buffer are undefined and a partial copy
+    // (just the dirty sub-rect) would leave stale/garbage pixels elsewhere.
     if (SDL_RenderCopy(sdl_renderer, sdl_texture, NULL, NULL) != 0) {
 		return -1;
 	}
-	
+
+	// Composite any active RAVE / OpenGL 3D overlays on top of the 2D framebuffer.
+	// Use a non-blocking lock: if a RAVE render is in progress on this thread
+	// (it holds the GL lock across NativeRenderStart..End), skip the overlay
+	// this frame rather than self-deadlocking; it composites on a later VBL.
+	if (gles_compositor_has_overlay()) {
+		if (gles_gl_trylock() == 0) {
+			gles_compositor_composite_overlays(out_w, out_h);
+			gles_gl_unlock();
+		}
+	}
+
     // Update the display
 	SDL_RenderPresent(sdl_renderer);
-    
+
+	if (video_profile_enabled) {
+		video_profile_add(VPROF_RENDER, GetTicks_usec() - t_render);
+		video_profile_frame_end();
+	}
+
     // Indicate success to the caller!
     return 0;
 }
@@ -1063,12 +1341,15 @@ void driver_base::init()
 	the_buffer_copy = (uint8 *)malloc(the_buffer_size);
 	D(bug("the_buffer = %p, the_buffer_copy = %p, the_host_buffer = %p\n", the_buffer, the_buffer_copy, the_host_buffer));
 
-	// Check whether we can initialize the VOSF subsystem and it's profitable
+	// Check whether we can initialize the VOSF subsystem and it's profitable.
+	// The "force_vosf" pref overrides the profitability heuristic so VOSF
+	// (page-granular dirty tracking, which catches direct framebuffer writers
+	// the NQD path cannot) can be evaluated on real hardware.
 	if (!video_vosf_init(monitor)) {
 		WarningAlert(GetString(STR_VOSF_INIT_ERR));
 		use_vosf = false;
 	}
-	else if (!video_vosf_profitable()) {
+	else if (!video_vosf_profitable() && !PrefsFindBool("force_vosf")) {
 		video_vosf_exit();
 		printf("VOSF acceleration is not profitable on this platform, disabling it\n");
 		use_vosf = false;
@@ -1418,12 +1699,23 @@ bool VideoInit(bool classic)
 		return false;
 	if ((frame_buffer_lock = SDL_CreateMutex()) == NULL)
 		return false;
+	if ((nqd_dirty_mutex = SDL_CreateMutex()) == NULL)
+		return false;
 
 	// Init keycode translation
 	keycode_init();
 
 	// Read prefs
 	frame_skip = PrefsFindInt32("frameskip");
+	video_profile_enabled = PrefsFindBool("perf_profile");
+	nqd_dirty_tracking = PrefsFindBool("nqd_dirty");
+	nqd_diag_enabled = PrefsFindBool("nqd_diag");
+	present_full_enabled = PrefsFindBool("present_full");
+	gpu_present_pref = PrefsFindBool("video_gpu_present");
+	{
+		int32 present_hz = PrefsFindInt32("present_hz");
+		present_min_interval_usec = (present_hz > 0) ? (uint32)(1000000 / present_hz) : 0;
+	}
 	mouse_wheel_mode = PrefsFindInt32("mousewheelmode");
 	mouse_wheel_lines = PrefsFindInt32("mousewheellines");
 	mouse_wheel_reverse = mouse_wheel_lines < 0;
@@ -1871,6 +2163,18 @@ void SDL_monitor_desc::set_palette(uint8 *pal, int num_in)
 		for (int i=0; i<256; i++) {
 			int c = i & (num_in-1); // If there are less than 256 colors, we repeat the first entries (this makes color expansion easier)
 			ExpandMap[i] = SDL_MapRGB(drv->s->format, pal[c*3+0], pal[c*3+1], pal[c*3+2]);
+		}
+
+		// Stage the palette for the GPU present path (packed 0xAABBGGRR in
+		// memory => bytes R,G,B,A for an RGBA8 upload).
+		if (gpu_present_active) {
+			uint32 argb[256];
+			for (int i=0; i<256; i++) {
+				int c = i & (num_in-1);
+				argb[i] = (uint32)pal[c*3+0] | ((uint32)pal[c*3+1] << 8) |
+						  ((uint32)pal[c*3+2] << 16) | 0xff000000u;
+			}
+			gles_present_set_palette(argb);
 		}
 
 #ifdef ENABLE_VOSF
@@ -2471,9 +2775,145 @@ static void handle_events(void)
  *  Window display update
  */
 
+// Atomically fetch and clear the accumulated NQD dirty rectangle.
+// Returns true and fills *out when a region was pending.
+static bool nqd_take_dirty(SDL_Rect *out)
+{
+	if (!nqd_dirty_mutex)
+		return false;
+	bool valid;
+	SDL_LockMutex(nqd_dirty_mutex);
+	valid = nqd_dirty_valid;
+	if (valid) {
+		*out = nqd_dirty_rect;
+		nqd_dirty_valid = false;
+	}
+	SDL_UnlockMutex(nqd_dirty_mutex);
+	return valid;
+}
+
+// Emit a rolling [nqd:diag] summary roughly every 2 seconds.  Called at the end
+// of each scan pass (redraw thread) when the "nqd_diag" pref is enabled.
+static void nqd_diag_report(void)
+{
+	if (!nqd_diag_enabled)
+		return;
+	const uint64 now = GetTicks_usec();
+	if (nqd_diag_window_start == 0) {
+		nqd_diag_window_start = now;
+		return;
+	}
+	const uint64 elapsed = now - nqd_diag_window_start;
+	if (elapsed < 2000000)
+		return;
+	// Present-level deferral (the path-agnostic signature of the artifacts).
+	printf("[nqd:diag] %.2fs | presents %llu | deferred: %llu presents %llu tiles %.3f Mpx | "
+		   "uploaded %.3f Mpx/present avg\n",
+		   elapsed / 1000000.0,
+		   (unsigned long long)nqd_diag_presents,
+		   (unsigned long long)nqd_diag_present_deferred,
+		   (unsigned long long)nqd_diag_pdef_tiles,
+		   nqd_diag_pdef_px / 1000000.0,
+		   nqd_diag_presents ? (nqd_diag_upload_px / 1000000.0) / nqd_diag_presents : 0.0);
+	// Scan-side (only populated when VOSF is OFF and the bbox scan path runs).
+	if (nqd_diag_passes) {
+		const double mean_w = nqd_diag_union_n ? (double)nqd_diag_union_w_sum / nqd_diag_union_n : 0.0;
+		const double mean_h = nqd_diag_union_n ? (double)nqd_diag_union_h_sum / nqd_diag_union_n : 0.0;
+		printf("[nqd:diag]   scan passes %llu (limited %llu full %llu) | deferred %llu passes %llu tiles %.3f Mpx | union mean %.0fx%.0f\n",
+			   (unsigned long long)nqd_diag_passes,
+			   (unsigned long long)nqd_diag_limited,
+			   (unsigned long long)nqd_diag_full,
+			   (unsigned long long)nqd_diag_deferred_passes,
+			   (unsigned long long)nqd_diag_deferred_boxes,
+			   nqd_diag_deferred_px / 1000000.0,
+			   mean_w, mean_h);
+	}
+	fflush(stdout);
+	nqd_diag_passes = nqd_diag_limited = nqd_diag_full = 0;
+	nqd_diag_deferred_boxes = nqd_diag_deferred_px = nqd_diag_deferred_passes = 0;
+	nqd_diag_union_w_sum = nqd_diag_union_h_sum = nqd_diag_union_n = 0;
+	nqd_diag_presents = nqd_diag_present_deferred = 0;
+	nqd_diag_pdef_tiles = nqd_diag_pdef_px = nqd_diag_upload_px = 0;
+	nqd_diag_window_start = now;
+}
+
+// Present-level deferral measurement.  Called from present_sdl_video with the
+// rectangle actually being uploaded this present.  Compares the_buffer against a
+// shadow of the displayed texture and counts changed pixels left outside the
+// upload rect (visible tearing/lag), then advances the shadow within the upload
+// rect.  Runs on the renderer thread, where the guest (same thread) is not
+// concurrently writing the_buffer, so the comparison is consistent.
+static void nqd_diag_present(const SDL_Rect &up)
+{
+	if (!nqd_diag_enabled || drv == NULL)
+		return;
+	const VIDEO_MODE &mode = drv->mode;
+	const uint32 W = VIDEO_MODE_X, H = VIDEO_MODE_Y;
+	const uint32 row = VIDEO_MODE_ROW_BYTES;
+	if (W == 0 || H == 0 || row < W)
+		return;
+	const uint32 bpp = row / W;
+	const size_t sz = (size_t)row * H;
+	if (nqd_diag_shadow == NULL || nqd_diag_shadow_size != sz) {
+		free(nqd_diag_shadow);
+		nqd_diag_shadow = (uint8 *)malloc(sz);
+		nqd_diag_shadow_size = nqd_diag_shadow ? sz : 0;
+		if (nqd_diag_shadow)
+			memcpy(nqd_diag_shadow, the_buffer, sz);
+		return;								// first pass establishes the baseline
+	}
+	int ux0 = up.x, uy0 = up.y, ux1 = up.x + up.w, uy1 = up.y + up.h;
+	if (ux0 < 0) ux0 = 0;
+	if (uy0 < 0) uy0 = 0;
+	if (ux1 > (int)W) ux1 = W;
+	if (uy1 > (int)H) uy1 = H;
+
+	const uint32 N = 64;
+	uint64 deferred_px = 0, deferred_tiles = 0;
+	for (uint32 y = 0; y < H; y += N) {
+		uint32 th = (H - y < N) ? (H - y) : N;
+		for (uint32 x = 0; x < W; x += N) {
+			uint32 tw = (W - x < N) ? (W - x) : N;
+			// Skip tiles fully covered by this present's upload rect
+			if ((int)x >= ux0 && (int)y >= uy0 &&
+				(int)(x + tw) <= ux1 && (int)(y + th) <= uy1)
+				continue;
+			const int xb = x * bpp;
+			const int xs = tw * bpp;
+			bool td = false;
+			for (uint32 j = y; j < y + th; j++) {
+				const size_t off = (size_t)j * row + xb;
+				if (memcmp(the_buffer + off, nqd_diag_shadow + off, xs) != 0) {
+					td = true;
+					deferred_px += tw;
+				}
+			}
+			if (td) deferred_tiles++;
+		}
+	}
+	// Advance the shadow within the uploaded rect: the texture now shows these.
+	for (int j = uy0; j < uy1; j++) {
+		const size_t off = (size_t)j * row + (size_t)ux0 * bpp;
+		const size_t len = (size_t)(ux1 - ux0) * bpp;
+		if (len)
+			memcpy(nqd_diag_shadow + off, the_buffer + off, len);
+	}
+
+	nqd_diag_presents++;
+	if (ux1 > ux0 && uy1 > uy0)
+		nqd_diag_upload_px += (uint64)(ux1 - ux0) * (uy1 - uy0);
+	if (deferred_tiles) {
+		nqd_diag_present_deferred++;
+		nqd_diag_pdef_tiles += deferred_tiles;
+		nqd_diag_pdef_px += deferred_px;
+	}
+	nqd_diag_report();
+}
+
 // Static display update (fixed frame rate, but incremental)
 static void update_display_static(driver_base *drv)
 {
+	VideoProfileScope _scan(VPROF_SCAN);
 	// Incremental update code
 	int wide = 0, high = 0;
 	uint32 x1, x2, y1, y2;
@@ -2629,8 +3069,11 @@ static void update_display_static(driver_base *drv)
 // XXX use NQD bounding boxes to help detect dirty areas?
 static void update_display_static_bbox(driver_base *drv)
 {
+	VideoProfileScope _scan(VPROF_SCAN);
 	const VIDEO_MODE &mode = drv->mode;
-	bool blit = (int)VIDEO_MODE_DEPTH == VIDEO_DEPTH_16BIT;
+	// The GPU present path uploads directly from the_buffer, so the 16-bit
+	// Screen_blit into the SDL surface would be wasted work; skip it.
+	bool blit = ((int)VIDEO_MODE_DEPTH == VIDEO_DEPTH_16BIT) && !gpu_present_active;
 
 	// Allocate bounding boxes for SDL_UpdateRects()
 	const uint32 N_PIXELS = 64;
@@ -2638,6 +3081,45 @@ static void update_display_static_bbox(driver_base *drv)
 	const uint32 n_y_boxes = (VIDEO_MODE_Y + N_PIXELS - 1) / N_PIXELS;
 	SDL_Rect *boxes = (SDL_Rect *)alloca(sizeof(SDL_Rect) * n_x_boxes * n_y_boxes);
 	uint32 nr_boxes = 0;
+
+	// Determine the region to scan.  When QuickDraw acceleration reports a
+	// dirty rectangle we only diff that area (aligned to the tile grid),
+	// which avoids memcmp'ing the entire framebuffer every pass.  A full scan
+	// is forced every NQD_FULL_SCAN_INTERVAL passes so that direct
+	// (non-accelerated) framebuffer writers are still detected.
+	uint32 scan_x0 = 0, scan_y0 = 0, scan_x1 = VIDEO_MODE_X, scan_y1 = VIDEO_MODE_Y;
+	bool diag_limited = false;					// this pass scanned only the NQD bbox
+	if (nqd_dirty_tracking) {
+		static uint32 full_scan_counter = 0;
+		const bool force_full = (++full_scan_counter >= NQD_FULL_SCAN_INTERVAL);
+		SDL_Rect nqd;
+		const bool have_nqd = nqd_take_dirty(&nqd);
+		if (force_full)
+			full_scan_counter = 0;
+		if (nqd_diag_enabled && have_nqd) {
+			nqd_diag_union_w_sum += (nqd.w > 0 ? nqd.w : 0);
+			nqd_diag_union_h_sum += (nqd.h > 0 ? nqd.h : 0);
+			nqd_diag_union_n++;
+		}
+		if (have_nqd && !force_full) {
+			int rx0 = nqd.x, ry0 = nqd.y, rx1 = nqd.x + nqd.w, ry1 = nqd.y + nqd.h;
+			if (rx0 < 0) rx0 = 0;
+			if (ry0 < 0) ry0 = 0;
+			if (rx1 > (int)VIDEO_MODE_X) rx1 = VIDEO_MODE_X;
+			if (ry1 > (int)VIDEO_MODE_Y) ry1 = VIDEO_MODE_Y;
+			if (rx1 <= rx0 || ry1 <= ry0) {
+				// Degenerate hint, nothing to do this pass
+				if (nqd_diag_enabled) { nqd_diag_passes++; nqd_diag_limited++; }
+				return;
+			}
+			// Align the scan window down to the tile grid
+			scan_x0 = (rx0 / N_PIXELS) * N_PIXELS;
+			scan_y0 = (ry0 / N_PIXELS) * N_PIXELS;
+			scan_x1 = rx1;
+			scan_y1 = ry1;
+			diag_limited = true;
+		}
+	}
 
 	// Lock surface, if required
 	if (SDL_MUSTLOCK(drv->s))
@@ -2647,14 +3129,14 @@ static void update_display_static_bbox(driver_base *drv)
 	const uint32 bytes_per_row = VIDEO_MODE_ROW_BYTES;
 	const uint32 bytes_per_pixel = bytes_per_row / VIDEO_MODE_X;
 	const uint32 dst_bytes_per_row = drv->s->pitch;
-	for (uint32 y = 0; y < VIDEO_MODE_Y; y += N_PIXELS) {
+	for (uint32 y = scan_y0; y < scan_y1; y += N_PIXELS) {
 		uint32 h = N_PIXELS;
-		if (h > VIDEO_MODE_Y - y)
-			h = VIDEO_MODE_Y - y;
-		for (uint32 x = 0; x < VIDEO_MODE_X; x += N_PIXELS) {
+		if (h > scan_y1 - y)
+			h = scan_y1 - y;
+		for (uint32 x = scan_x0; x < scan_x1; x += N_PIXELS) {
 			uint32 w = N_PIXELS;
-			if (w > VIDEO_MODE_X - x)
-				w = VIDEO_MODE_X - x;
+			if (w > scan_x1 - x)
+				w = scan_x1 - x;
 			const int xs = w * bytes_per_pixel;
 			const int xb = x * bytes_per_pixel;
 			bool dirty = false;
@@ -2680,6 +3162,50 @@ static void update_display_static_bbox(driver_base *drv)
 	// Unlock surface, if required
 	if (SDL_MUSTLOCK(drv->s))
 		SDL_UnlockSurface(drv->s);
+
+	// Diagnostic (nqd_diag): on a limited pass, measure pixels that already
+	// differ in the_buffer but lie OUTSIDE the scanned window.  These are guest
+	// pixels written this frame that this present will not upload -- the direct
+	// signature of the partial-frame hypothesis.  We deliberately do NOT update
+	// the_buffer_copy here so the deferral is re-counted until a full scan picks
+	// it up (matching the "self-heals every NQD_FULL_SCAN_INTERVAL" behaviour).
+	if (nqd_diag_enabled) {
+		nqd_diag_passes++;
+		if (diag_limited) {
+			nqd_diag_limited++;
+			uint64 deferred_px = 0, deferred_tiles = 0;
+			for (uint32 y = 0; y < VIDEO_MODE_Y; y += N_PIXELS) {
+				uint32 h = N_PIXELS;
+				if (h > VIDEO_MODE_Y - y) h = VIDEO_MODE_Y - y;
+				for (uint32 x = 0; x < VIDEO_MODE_X; x += N_PIXELS) {
+					uint32 w = N_PIXELS;
+					if (w > VIDEO_MODE_X - x) w = VIDEO_MODE_X - x;
+					// Skip tiles fully inside the scanned window
+					if (x >= scan_x0 && y >= scan_y0 &&
+						x + w <= scan_x1 && y + h <= scan_y1)
+						continue;
+					const int xs = w * bytes_per_pixel;
+					const int xb = x * bytes_per_pixel;
+					bool tile_dirty = false;
+					for (uint32 j = y; j < (y + h); j++) {
+						const uint32 yb = j * bytes_per_row;
+						if (memcmp(&the_buffer[yb + xb], &the_buffer_copy[yb + xb], xs) != 0) {
+							tile_dirty = true;
+							deferred_px += w;
+						}
+					}
+					if (tile_dirty) deferred_tiles++;
+				}
+			}
+			if (deferred_tiles) {
+				nqd_diag_deferred_passes++;
+				nqd_diag_deferred_boxes += deferred_tiles;
+				nqd_diag_deferred_px += deferred_px;
+			}
+		} else {
+			nqd_diag_full++;
+		}
+	}
 
 	// Refresh display
 	if (nr_boxes)
@@ -2779,11 +3305,26 @@ static void video_refresh_window_static(void)
 	// Ungrab mouse if requested
 	possibly_ungrab_mouse();
 
+	// Determine the effective frame-skip.  When QuickDraw acceleration is
+	// actively producing dirty rectangles, the per-pass scan is cheap (it
+	// only touches the dirty region), so we refresh on every tick for smooth
+	// 60 Hz output.  Otherwise we fall back to the configured frame_skip to
+	// bound the cost of full-frame memcmp scans for non-accelerated games.
+	uint32 eff_skip = frame_skip;
+	const VIDEO_MODE &mode = drv->mode;
+	if (nqd_dirty_tracking && (int)VIDEO_MODE_DEPTH >= VIDEO_DEPTH_8BIT) {
+		const uint64 now = GetTicks_usec();
+		const uint64 seen = nqd_hint_seen_usec;
+		if (seen != 0 && now - seen < 500000)		// hint within last 500 ms
+			eff_skip = 1;
+	}
+	if (eff_skip < 1)
+		eff_skip = 1;
+
 	// Update display (static variant)
 	static uint32 tick_counter = 0;
-	if (++tick_counter >= frame_skip) {
+	if (++tick_counter >= eff_skip) {
 		tick_counter = 0;
-		const VIDEO_MODE &mode = drv->mode;
 		if ((int)VIDEO_MODE_DEPTH >= VIDEO_DEPTH_8BIT)
 			update_display_static_bbox(drv);
 		else
@@ -2901,7 +3442,134 @@ void video_set_dirty_area(int x, int y, int w, int h)
 	}
 #endif
 
-	// XXX handle dirty bounding boxes for non-VOSF modes
+	// Non-VOSF: accumulate the dirty rectangle so the redraw thread can scan
+	// just this region instead of the whole framebuffer.  Called from the
+	// emulation thread (NQD hooks), so guard the shared rect with its mutex.
+	if (!nqd_dirty_tracking || !nqd_dirty_mutex || w <= 0 || h <= 0)
+		return;
+	SDL_Rect r = { x, y, w, h };
+	SDL_LockMutex(nqd_dirty_mutex);
+	if (!nqd_dirty_valid) {
+		nqd_dirty_rect = r;
+		nqd_dirty_valid = true;
+	} else {
+		SDL_UnionRect(&nqd_dirty_rect, &r, &nqd_dirty_rect);
+	}
+	SDL_UnlockMutex(nqd_dirty_mutex);
+	nqd_hint_seen_usec = GetTicks_usec();
+}
+#endif
+
+
+/*
+ *  RAVE 3D display helpers
+ *
+ *  video_blit_rave_fbo  -- called from NativeRenderEnd to copy the GLES readback
+ *  buffer into the_buffer (Mac framebuffer) so QuickDraw menus/dialogs drawn on
+ *  top of 3D content see correct pixels.  The FBO origin is bottom-left (GL
+ *  convention) so we flip vertically while copying.  We also convert RGBA → BGRA
+ *  to match the ARGB8888/BGRA8888 host surface format.
+ *
+ *  video_clear_rave_display -- called when a RAVE draw context is destroyed; clears
+ *  the registered display rect back to zero (transparent/black) so the compositor
+ *  slot is removed cleanly.
+ *
+ *  video_set_rave_display -- called from RaveCreateMetalOverlay to register the
+ *  draw context's position and size (used by video_clear_rave_display).
+ */
+
+#ifdef SHEEPSHAVER
+static uint32_t s_rave_display_id = 0;
+static int s_rave_x = 0, s_rave_y = 0, s_rave_w = 0, s_rave_h = 0;
+
+extern "C" void video_set_rave_display(unsigned int ctx_id, int x, int y, int w, int h)
+{
+	s_rave_display_id = ctx_id;
+	s_rave_x = x; s_rave_y = y;
+	s_rave_w = w; s_rave_h = h;
+}
+
+extern "C" void video_blit_rave_fbo(const uint8_t *rgba, int src_w, int src_h, int dst_x, int dst_y)
+{
+	if (!the_buffer || !rgba || src_w <= 0 || src_h <= 0) return;
+
+	const VideoInfo &mode = VModes[cur_mode];
+	const int screen_w = (int)mode.viXsize;
+	const int screen_h = (int)mode.viYsize;
+	const int row_bytes = (int)mode.viRowBytes;
+
+	// Bytes per Mac pixel.  CRITICAL: this must match the guest framebuffer
+	// depth.  Writing a fixed 4 bytes/pixel into a 16-bit (2 bytes/pixel)
+	// framebuffer overflows each row to ~2x width and reinterprets the BGRA
+	// bytes as RGB555 pairs, producing wrong-colored, horizontally-replicated
+	// ghost copies of the 3D scene alongside the play area.
+	const int bpp = (screen_w > 0) ? (row_bytes / screen_w) : 4;
+
+	// Clip to Mac framebuffer bounds
+	int copy_w = src_w, copy_h = src_h;
+	if (dst_x + copy_w > screen_w) copy_w = screen_w - dst_x;
+	if (dst_y + copy_h > screen_h) copy_h = screen_h - dst_y;
+	if (copy_w <= 0 || copy_h <= 0 || dst_x < 0 || dst_y < 0) return;
+
+	if (bpp == 2) {
+		// 16-bit guest: pack RGBA8 -> Mac big-endian RGB555 (matches the GPU
+		// present 16-bit decode shader: hi byte = 0RRRRRGG, lo = GGGBBBBB).
+		for (int y = 0; y < copy_h; y++) {
+			const uint8_t *src_row = rgba + (size_t)(src_h - 1 - y) * src_w * 4;
+			uint8_t *dst_row = the_buffer + (size_t)(dst_y + y) * row_bytes + dst_x * 2;
+			for (int x = 0; x < copy_w; x++) {
+				uint8_t r5 = src_row[x*4 + 0] >> 3;
+				uint8_t g5 = src_row[x*4 + 1] >> 3;
+				uint8_t b5 = src_row[x*4 + 2] >> 3;
+				uint16_t v = (uint16_t)((r5 << 10) | (g5 << 5) | b5);
+				dst_row[x*2 + 0] = (uint8_t)(v >> 8);   // big-endian hi byte
+				dst_row[x*2 + 1] = (uint8_t)(v & 0xFF);  // lo byte
+			}
+		}
+	} else if (bpp == 4) {
+		// 32-bit guest: RGBA (bottom-left origin) -> BGRA (top-left origin)
+		for (int y = 0; y < copy_h; y++) {
+			const uint8_t *src_row = rgba + (size_t)(src_h - 1 - y) * src_w * 4;
+			uint8_t *dst_row = the_buffer + (size_t)(dst_y + y) * row_bytes + dst_x * 4;
+			for (int x = 0; x < copy_w; x++) {
+				// src: R G B A  →  dst: B G R A (BGRA8888 / ARGB stored LE)
+				dst_row[x*4 + 0] = src_row[x*4 + 2]; // B
+				dst_row[x*4 + 1] = src_row[x*4 + 1]; // G
+				dst_row[x*4 + 2] = src_row[x*4 + 0]; // R
+				dst_row[x*4 + 3] = src_row[x*4 + 3]; // A
+			}
+		}
+	} else {
+		// 8-bit (indexed) or unknown depth: no meaningful direct blit -- the GPU
+		// compositor overlay handles on-screen 3D for these modes.
+		return;
+	}
+
+	// Mark region dirty so the VOSF / periodic refresh picks it up
+	video_set_dirty_area(dst_x, dst_y, copy_w, copy_h);
+}
+
+extern "C" void video_clear_rave_display(void)
+{
+	if (!the_buffer || s_rave_w <= 0 || s_rave_h <= 0) return;
+
+	const VideoInfo &mode = VModes[cur_mode];
+	const int screen_w = (int)mode.viXsize;
+	const int screen_h = (int)mode.viYsize;
+	const int row_bytes = (int)mode.viRowBytes;
+
+	int x = s_rave_x, y = s_rave_y, w = s_rave_w, h = s_rave_h;
+	if (x + w > screen_w) w = screen_w - x;
+	if (y + h > screen_h) h = screen_h - y;
+	if (w <= 0 || h <= 0 || x < 0 || y < 0) return;
+
+	for (int row = 0; row < h; row++)
+		memset(the_buffer + (size_t)(y + row) * row_bytes + x * 4, 0, (size_t)w * 4);
+
+	video_set_dirty_area(x, y, w, h);
+
+	// Clear compositor overlay slot
+	gles_compositor_clear_overlay(COMPOSITOR_OVERLAY_RAVE);
 }
 #endif
 

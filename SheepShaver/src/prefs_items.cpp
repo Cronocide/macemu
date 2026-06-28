@@ -48,6 +48,15 @@ prefs_desc common_prefs_items[] = {
 	{"ramsize", TYPE_INT32, false,      "size of Mac RAM in bytes"},
 	{"frameskip", TYPE_INT32, false,    "number of frames to skip in refreshed video modes"},
 	{"gfxaccel", TYPE_BOOLEAN, false,   "turn on QuickDraw acceleration"},
+	{"gfx_accel", TYPE_BOOLEAN, false,  "turn on 3D (RAVE/OpenGL) acceleration"},
+	{"gfx_accel_log", TYPE_BOOLEAN, false, "enable verbose 3D acceleration logging"},
+	{"perf_profile", TYPE_BOOLEAN, false, "log video pipeline and JIT throughput counters"},
+	{"video_gpu_present", TYPE_BOOLEAN, false, "convert and present the 2D framebuffer on the GPU (GLES)"},
+	{"nqd_dirty", TYPE_BOOLEAN, false, "use QuickDraw accel dirty rects to skip full-frame scans"},
+	{"nqd_diag", TYPE_BOOLEAN, false, "log QuickDraw accel blit params and deferred-frame diagnostics"},
+	{"present_full", TYPE_BOOLEAN, false, "upload the whole framebuffer every present (diagnostic: removes partial-frame deferral)"},
+	{"present_hz", TYPE_INT32, false, "cap present rate to this many Hz (0 = uncapped)"},
+	{"force_vosf", TYPE_BOOLEAN, false, "force-enable VOSF even if the heuristic says unprofitable"},
 	{"nocdrom", TYPE_BOOLEAN, false,    "don't install CD-ROM driver"},
 	{"nonet", TYPE_BOOLEAN, false,      "don't use Ethernet"},
 	{"nosound", TYPE_BOOLEAN, false,    "don't enable sound output"},
@@ -91,6 +100,15 @@ void AddPrefsDefaults(void)
 	PrefsAddInt32("ramsize", 16 * 1024 * 1024);
 	PrefsAddInt32("frameskip", 8);
 	PrefsAddBool("gfxaccel", true);
+	PrefsAddBool("gfx_accel", true);
+	PrefsAddBool("gfx_accel_log", false);
+	PrefsAddBool("perf_profile", false);
+	PrefsAddBool("video_gpu_present", false);
+	PrefsAddBool("nqd_dirty", true);
+	PrefsAddBool("nqd_diag", false);
+	PrefsAddBool("present_full", false);
+	PrefsAddInt32("present_hz", 0);
+	PrefsAddBool("force_vosf", false);
 	PrefsAddBool("nocdrom", false);
 	PrefsAddBool("nonet", false);
 	PrefsAddBool("nosound", false);

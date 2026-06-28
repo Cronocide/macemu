@@ -29,6 +29,7 @@
 #include "user_strings.h"
 #include "audio.h"
 #include "audio_defs.h"
+#include "timing_log.h"
 
 #include <queue>
 
@@ -276,6 +277,9 @@ static int time_to_stream_bytes(int time_ms) {
 
 static int interrupt_thread_func(void *data)
 {
+	// Optionally raise scheduling priority / pin (SHEEPSHAVER_RT_AUDIO)
+	thread_set_realtime("audio");
+
 	while (!interrupt_thread_quit) {
 
 	int target_queue_size = time_to_stream_bytes(INTERRUPT_STREAM_QUEUE_TARGET_MS);
@@ -332,6 +336,8 @@ static int interrupt_thread_func(void *data)
 				int work_size = ReadMacInt32(apple_stream_info + scd_sampleCount) * (source_sample_size >> 3) * source_channels;
 				if (work_size == 0)
 					break; // no more audio available right now
+				if (timing_log_active)
+					timing_log_audio("data", work_size, target_queue_size, audio_sample_clock);
 
 				uint8 buf[work_size];
 
@@ -404,8 +410,11 @@ static void SDLCALL stream_func(void *, SDL_AudioStream *stream, int stream_len,
 
 	uint8 src[stream_len], dst[stream_len];
 	int i = SDL_GetAudioStreamData(interrupt_stream, src, stream_len);
-	if (i < stream_len)
+	if (i < stream_len) {
+		if (timing_log_active && AudioStatus.num_sources)
+			timing_log_audio("underrun", i, stream_len, audio_sample_clock);
 		memset(src + i, silence_byte, stream_len - i);
+	}
 	memset(dst, silence_byte, stream_len);
 	//SDL_AudioSpec audio_spec;
 	//int r = SDL_GetAudioStreamFormat(stream, NULL, &audio_spec);// little endianが帰ってくる
@@ -414,6 +423,14 @@ static void SDLCALL stream_func(void *, SDL_AudioStream *stream, int stream_len,
 	MixAudio_bincue(dst, stream_len);
 #endif
 	SDL_PutAudioStreamData(stream, dst, stream_len);
+
+	// Advance the media clock by the frames handed to the device (true
+	// playback-rate reference, paced by SDL draining the output stream).
+	{
+		int frame_bytes = SDL_AUDIO_FRAMESIZE(audio_spec);
+		if (frame_bytes > 0)
+			audio_sample_clock += (uint64)stream_len / frame_bytes;
+	}
 }
 
 

@@ -35,6 +35,12 @@
 // Generate PowerPC thunks for GetResource() replacements?
 #define POWERPC_GET_RESOURCE_THUNKS 1
 
+// gfxaccel thunk initializers (defined in SheepShaver/src/gfxaccel/{rave,gl}_thunks.cpp).
+// GLThunksInit() returns success but the boot path treats it as best-effort;
+// emulator boot continues even if GL TVECT allocation fails.
+extern void RaveThunksInit(void);
+extern bool GLThunksInit(void);
+
 
 /*		NativeOp instruction format:
 		+------------+-------------------------+--+-----------+------------+
@@ -97,6 +103,12 @@ uint32 NativeOpcode(int selector)
 	case NATIVE_GET_1_NAMED_RESOURCE:
   	case NATIVE_MAKE_EXECUTABLE:
 		opcode = POWERPC_NATIVE_OP(1, selector);
+		break;
+	case NATIVE_RAVE_DISPATCH:
+		opcode = POWERPC_NATIVE_OP(0, selector);
+		break;
+	case NATIVE_OPENGL_DISPATCH:
+		opcode = POWERPC_NATIVE_OP(0, selector);
 		break;
 	default:
 		abort();
@@ -270,6 +282,12 @@ bool ThunksInit(void)
 		native_op[i].tvect = base;
 		native_op[i].func  = base + 8;
 	}
+	// Initialize RAVE method TVECTs (must be after SheepMem is available)
+	RaveThunksInit();
+
+	// Initialize OpenGL TVECTs (must be after SheepMem is available)
+	GLThunksInit();
+
 #if POWERPC_GET_RESOURCE_THUNKS
 	generate_powerpc_thunks();
 	native_op[NATIVE_GET_RESOURCE].func = get_resource_func;

@@ -49,6 +49,7 @@ bool audio_open = false;			// Flag: audio is initialized and ready
 int audio_frames_per_block;			// Number of audio frames per block
 uint32 audio_component_flags;		// Component feature flags
 uint32 audio_data = 0;				// Mac address of global data area
+volatile uint64 audio_sample_clock = 0;	// Frames handed to the host output device (media clock)
 static int open_count = 0;			// Open/close nesting count
 
 bool AudioAvailable = false;		// Flag: audio output available (from the software point of view)

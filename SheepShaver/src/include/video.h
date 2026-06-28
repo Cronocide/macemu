@@ -148,6 +148,30 @@ extern bool video_can_change_cursor(void);
 extern int16 video_mode_change(VidLocals *csSave, uint32 ParamPtr);
 extern void video_set_dirty_area(int x, int y, int w, int h);
 
+// Drop any active RAVE 3D overlay from the display.  Phase B provides a
+// weak no-op stub (see gfxaccel.cpp); Phase C overrides it from the SDL
+// compositor in video_sdl2.cpp once gles_compositor is wired up.
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern void video_clear_rave_display(void);
+
+// Register the RAVE draw context's position and size for video_clear_rave_display.
+extern void video_set_rave_display(unsigned int ctx_id, int x, int y, int w, int h);
+
+// Push a CPU-side readback of a RAVE/GL FBO into the Mac framebuffer at the
+// given Mac coordinates.  Used by renderers that elected to do glReadPixels
+// (e.g. for QuickDraw z-order with overlapping menus) instead of relying on
+// the GLES compositor's GPU overlay path.  Phase C ships a weak no-op
+// (the compositor path is primary); a real implementation copying RGBA8
+// into the_buffer is added when a title needs it.
+extern void video_blit_rave_fbo(const uint8 *src_rgba,
+                                    int width, int height,
+                                    int dst_x, int dst_y);
+#ifdef __cplusplus
+}
+#endif
+
 extern int16 VSLDoInterruptService(uint32 arg1);
 extern void NQDMisc(uint32 arg1, uintptr arg2);
 

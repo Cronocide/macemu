@@ -67,8 +67,13 @@ enum {
   NATIVE_NAMED_CHECK_LOAD_INVOC,
   NATIVE_GET_NAMED_RESOURCE,
   NATIVE_GET_1_NAMED_RESOURCE,
+  NATIVE_RAVE_DISPATCH,
+  NATIVE_OPENGL_DISPATCH,
   NATIVE_OP_MAX
 };
+
+// Ensure we don't exceed the 6-bit NATIVE_OP field (bits 20-25)
+static_assert(NATIVE_OP_MAX <= 64, "Too many NATIVE_OP entries; max is 64 (6-bit field)");
 
 // Initialize the thunks system
 extern bool ThunksInit(void);

@@ -42,6 +42,46 @@
 
 #ifdef SHEEPSHAVER
 #include "timer.h"
+#include "prefs.h"
+
+// Lightweight, pref-gated JIT throughput counters ("perf_profile").  When the
+// flag is false (default) the increments are a single predicted branch, and the
+// periodic report is skipped, so this is safe to leave compiled in.
+static bool   ppc_perf_profile = false;
+static bool   ppc_perf_profile_init = false;
+static uint64 ppc_perf_blocks = 0;			// JIT blocks dispatched
+static uint64 ppc_perf_compiles = 0;		// new blocks compiled
+static uint64 ppc_perf_misses = 0;			// fast-cache lookup misses
+static uint64 ppc_perf_spc_exits = 0;		// block exits with pending spcflags
+static uint64 ppc_perf_irqs = 0;			// interrupts handled
+static uint64 ppc_perf_window_start = 0;
+
+static void ppc_perf_maybe_report(void)
+{
+	if (!ppc_perf_profile)
+		return;
+	const uint64 now = GetTicks_usec();
+	if (ppc_perf_window_start == 0) {
+		ppc_perf_window_start = now;
+		return;
+	}
+	const uint64 elapsed = now - ppc_perf_window_start;
+	if (elapsed < 2000000)						// report roughly every 2 seconds
+		return;
+	const double secs = elapsed / 1000000.0;
+	printf("[perf:jit] %.2fs | blocks %.2fM (%.2fM/s) | compiles %llu | misses %llu | "
+		   "spc_exits %llu | irqs %llu (%.0f/s)\n",
+		   secs,
+		   ppc_perf_blocks / 1e6, ppc_perf_blocks / secs / 1e6,
+		   (unsigned long long)ppc_perf_compiles,
+		   (unsigned long long)ppc_perf_misses,
+		   (unsigned long long)ppc_perf_spc_exits,
+		   (unsigned long long)ppc_perf_irqs, ppc_perf_irqs / secs);
+	fflush(stdout);
+	ppc_perf_blocks = ppc_perf_compiles = ppc_perf_misses = 0;
+	ppc_perf_spc_exits = ppc_perf_irqs = 0;
+	ppc_perf_window_start = now;
+}
 #endif
 
 #if PPC_PROFILE_GENERIC_CALLS
@@ -160,6 +200,7 @@ void powerpc_cpu::init_registers()
 void powerpc_cpu::init_flight_recorder()
 {
 #if PPC_FLIGHT_RECORDER
+	logging = false;
 	log_ptr = 0;
 	log_ptr_wrapped = false;
 #endif
@@ -196,6 +237,8 @@ void powerpc_cpu::do_record_step(uint32 pc, uint32 opcode)
 #if PPC_FLIGHT_RECORDER
 void powerpc_cpu::start_log()
 {
+	log_ptr = 0;
+	log_ptr_wrapped = false;
 	logging = true;
 	invalidate_cache();
 }
@@ -655,6 +698,12 @@ void powerpc_cpu::execute(uint32 entry)
 #if PPC_EXECUTE_DUMP_STATE
 	const bool dump_state = true;
 #endif
+#ifdef SHEEPSHAVER
+	if (!ppc_perf_profile_init) {
+		ppc_perf_profile = PrefsFindBool("perf_profile");
+		ppc_perf_profile_init = true;
+	}
+#endif
 	execute_depth++;
 #if PPC_DECODE_CACHE || PPC_ENABLE_JIT
 	if (execute_depth == 1 || (PPC_ENABLE_JIT && PPC_REENTRANT_JIT)) {
@@ -682,6 +731,9 @@ void powerpc_cpu::execute(uint32 entry)
 					uint32 pre_lr = lr();
 					codegen.execute(bi->entry_point);
 					uint32 post_exec_pc = pc();
+#ifdef SHEEPSHAVER
+					if (ppc_perf_profile) ppc_perf_blocks++;
+#endif
 #if PPC_AARCH64_JIT_DEBUG
 					jit_dispatch_ring[jit_dispatch_ring_idx] = { pre_exec_pc, post_exec_pc };
 
@@ -815,6 +867,15 @@ void powerpc_cpu::execute(uint32 entry)
 #if PPC_AARCH64_JIT_DEBUG
 						jit_spcflag_exit_count++;
 #endif
+#ifdef SHEEPSHAVER
+						if (ppc_perf_profile) {
+							ppc_perf_spc_exits++;
+							if (spcflags().test(SPCFLAG_CPU_HANDLE_INTERRUPT))
+								ppc_perf_irqs++;
+							if ((ppc_perf_spc_exits & 0x3ff) == 0)
+								ppc_perf_maybe_report();
+						}
+#endif
 						if (!check_spcflags())
 							goto return_site;
 
@@ -842,6 +903,9 @@ void powerpc_cpu::execute(uint32 entry)
 								jit_cache_miss_count, pc());
 						}
 #endif
+#ifdef SHEEPSHAVER
+						if (ppc_perf_profile) ppc_perf_misses++;
+#endif
 						break;
 					}
 				}
@@ -849,6 +913,9 @@ void powerpc_cpu::execute(uint32 entry)
 				// Compile new block
 #if PPC_AARCH64_JIT_DEBUG
 				jit_compile_count++;
+#endif
+#ifdef SHEEPSHAVER
+				if (ppc_perf_profile) ppc_perf_compiles++;
 #endif
 				bi = compile_block(pc());
 			}

@@ -563,13 +563,17 @@ powerpc_cpu::compile_block(uint32 entry_point)
 			break;
 		}
 		case PPC_I(BCCTR):		// Branch Conditional to Count Register
+		#if PPC_AARCH64_JIT_DEBUG
 			if (dpc >= 0x5046e180 && dpc <= 0x5046e200)
 				fprintf(stderr, "[JIT:XLATE] BCCTR at 0x%08x opcode=0x%08x\n", dpc, opcode);
+		#endif
 			dg.gen_load_T0_CTR_aligned();
 			goto do_branch;
 		case PPC_I(BCLR):		// Branch Conditional to Link Register
+		#if PPC_AARCH64_JIT_DEBUG
 			if (dpc >= 0x5046e180 && dpc <= 0x5046e200)
 				fprintf(stderr, "[JIT:XLATE] BCLR at 0x%08x opcode=0x%08x\n", dpc, opcode);
+		#endif
 			dg.gen_load_T0_LR_aligned();
 			goto do_branch;
 		{
@@ -1629,6 +1633,7 @@ powerpc_cpu::compile_block(uint32 entry_point)
 	if (disasm)
 		disasm_translation(entry_point, dpc - entry_point + 4, bi->entry_point, bi->size);
 
+	#if PPC_AARCH64_JIT_DEBUG >= 2
 	if (entry_point >= 0x5046e180 && entry_point <= 0x5046e200) {
 		fprintf(stderr, "[JIT:BLOCK] Compiled block at PPC 0x%08x, native %p, size %u bytes\n",
 			entry_point, bi->entry_point, bi->size);
@@ -1640,6 +1645,7 @@ powerpc_cpu::compile_block(uint32 entry_point)
 		}
 		fflush(stderr);
 	}
+	#endif
 
 	dg.gen_end();
 	my_block_cache.add_to_cl_list(bi);

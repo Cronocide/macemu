@@ -1738,7 +1738,7 @@ fi
 dnl Optimizations for aarch64 (Cortex-A53 / H700)
 case $host_cpu in
   aarch64*)
-    CPPFLAGS="$CPPFLAGS -DPPC_AARCH64_JIT_DEBUG=1 -DDYNGEN_DIRECT_BLOCK_CHAINING=1"
+    CPPFLAGS="$CPPFLAGS -DDYNGEN_DIRECT_BLOCK_CHAINING=1"
     CFLAGS="$CFLAGS -mcpu=cortex-a53 -O2"
     CXXFLAGS="$CXXFLAGS -mcpu=cortex-a53 -O2"
     ;;

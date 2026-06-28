@@ -105,6 +105,7 @@
 #include "xlowmem.h"
 #include "xpram.h"
 #include "timer.h"
+#include "timing_log.h"
 #include "adb.h"
 #include "video.h"
 #include "sys.h"
@@ -587,6 +588,16 @@ static void get_system_info(void)
 		}
 		closedir(cpus_dir);
 	}
+
+	// Record the resolved timebase frequency: a bad probe here alone skews
+	// every mftb-derived timing loop, so make it visible in the log.
+	if (timing_log_active) {
+		char tbuf[96];
+		snprintf(tbuf, sizeof(tbuf),
+			"\"timebase_hz\":%lld,\"bus_hz\":%lld",
+			(long long)TimebaseSpeed, (long long)BusClockSpeed);
+		timing_log_emit("clocks", tbuf);
+	}
 #endif
 
 	// Remap any newer G4/G5 processor to plain G4 for compatibility
@@ -811,6 +822,9 @@ int main(int argc, char **argv)
 	// Initialize variables
 	RAMBase = 0;
 	tzset();
+
+	// Open optional timing instrumentation log (SHEEPSHAVER_TIMING_LOG)
+	timing_log_init();
 
 	// Print some info
 	printf(GetString(STR_ABOUT_TEXT1), VERSION_MAJOR, VERSION_MINOR);
@@ -1301,6 +1315,9 @@ static void Quit(void)
 	// Exit preferences
 	PrefsExit();
 
+	// Close timing instrumentation log
+	timing_log_exit();
+
 #ifdef ENABLE_MON
 	// Exit mon
 	mon_exit();
@@ -1609,22 +1626,47 @@ static void *nvram_func(void *arg)
 bool tick_inhibit;
 static void *tick_func(void *arg)
 {
+	// Optionally raise scheduling priority / pin (SHEEPSHAVER_RT_TICK)
+	thread_set_realtime("tick");
+
 	int tick_counter = 0;
 	uint64 start = GetTicks_usec();
 	int64 ticks = 0;
 	uint64 next = start;
+	uint64 prev_tick = start;
 
 	while (!tick_thread_cancel) {
 
-		// Wait
+		// Wait until the next 60Hz deadline. An absolute monotonic sleep keeps
+		// per-tick phase from drifting under scheduler jitter (GetTicks_usec is
+		// CLOCK_MONOTONIC, so 'next' shares its epoch). CLOCK_MONOTONIC also
+		// freezes across suspend on Linux, avoiding post-resume interrupt bursts.
 		next += 16625;
-		int64 delay = next - GetTicks_usec();
+		uint64 now = GetTicks_usec();
+		if ((int64)(next - now) < -16625) {
+			// Fell far behind (heavy load or resume from a stall): re-anchor to
+			// "now" instead of firing a catch-up burst of 60Hz interrupts.
+			next = now + 16625;
+		}
+#if defined(HAVE_CLOCK_NANOSLEEP)
+		struct timespec deadline;
+		deadline.tv_sec = next / 1000000;
+		deadline.tv_nsec = (next % 1000000) * 1000;
+		clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, NULL);
+#else
+		int64 delay = next - now;
 		if (delay > 0)
 			Delay_usec(delay);
-		else if (delay < -16625)
-			next = GetTicks_usec();
+#endif
 		if (tick_inhibit) continue;
 		ticks++;
+
+		// Record the realized 60Hz interval against the 16625us target
+		if (timing_log_active) {
+			uint64 nowt = GetTicks_usec();
+			timing_log_tick(16625, (int64)(nowt - prev_tick));
+			prev_tick = nowt;
+		}
 
 #if !EMULATED_PPC
 		// Did we crash?

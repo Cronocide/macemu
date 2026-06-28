@@ -1252,7 +1252,10 @@ static inline uint64 get_tb_ticks(void)
 	uint64 ticks;
 #ifdef SHEEPSHAVER
 	const uint32 TBFreq = TimebaseSpeed;
-	ticks = muldiv64(GetTicks_usec(), TBFreq, 1000000);
+	// Derive the Time Base from a nanosecond clock so it advances smoothly.
+	// At microsecond resolution a multi-MHz TBFreq jumps ~25-40 ticks per
+	// read, which shows up as tempo jitter in games that time off mftb.
+	ticks = muldiv64(GetTicks_nsec(), TBFreq, 1000000000);
 #else
 	const uint32 TBFreq = 25 * 1000 * 1000; // 25 MHz
 	ticks = muldiv64((uint64)clock(), TBFreq, CLOCKS_PER_SEC);

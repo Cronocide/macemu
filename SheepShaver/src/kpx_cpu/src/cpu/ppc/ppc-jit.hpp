@@ -67,6 +67,17 @@ private:
 	bool gen_vector_generic_load_word(int mnemo, int vD, int rA, int rB);
 	bool gen_vector_generic_store_word(int mnemo, int vS, int rA, int rB);
 
+#if defined(__aarch64__)
+	bool gen_aarch64_vperm(int mnemo, int vD, int vA, int vB, int vC);
+	bool gen_aarch64_vsldoi(int mnemo, int vD, int vA, int vB, int SH);
+	bool gen_aarch64_vspltb(int mnemo, int vD, int UIMM, int vB);
+	bool gen_aarch64_vsplth(int mnemo, int vD, int UIMM, int vB);
+	bool gen_aarch64_vspltw(int mnemo, int vD, int UIMM, int vB);
+	bool gen_aarch64_vspltisb(int mnemo, int vD, int SIMM, int unused);
+	bool gen_aarch64_vspltish(int mnemo, int vD, int SIMM, int unused);
+	bool gen_aarch64_vspltisw(int mnemo, int vD, int SIMM, int unused);
+#endif
+
 #if defined(__i386__) || defined(__x86_64__)
 	bool gen_x86_lvx(int mnemo, int vD, int rA, int rB);
 	bool gen_x86_lvewx(int mnemo, int vD, int rA, int rB);

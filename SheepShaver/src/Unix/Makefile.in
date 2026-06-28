@@ -18,10 +18,13 @@ CXX = @CXX@
 GCR = @GCR@
 CFLAGS = @CFLAGS@
 CXXFLAGS = @CXXFLAGS@
-CPPFLAGS = @CPPFLAGS@ -I../include -I. -I../CrossPlatform -I../slirp
+CPPFLAGS = @CPPFLAGS@ -I../include -I. -I../CrossPlatform -I../slirp -I../gfxaccel/include
 DEFS = @DEFS@ -D_REENTRANT -DDATADIR=\"$(datadir)/$(APP)\"
 LDFLAGS = @LDFLAGS@
-LIBS = @LIBS@
+# 3D acceleration links GLESv2 directly (the renderer + compositor call
+# glGenTextures/glBindFramebuffer/etc. without going through SDL_GL_GetProcAddress).
+# EGL is pulled in for SDL_GL_GetCurrentContext on KMS/DRM targets like the H700.
+LIBS = @LIBS@ -lGLESv2 -lEGL
 SYSSRCS = @SYSSRCS@
 CPUSRCS = @CPUSRCS@
 MONSRCS = @MONSRCS@
@@ -64,14 +67,27 @@ DYNGENSRCS += $(filter %i386-dis.c,$(MONSRCS))
 endif
 
 ## Files
+# 3D acceleration sources.  Phase C links the real GLES RAVE renderer +
+# compositor; Phase D adds the OpenGL 1.x CFM units.  The *_stub.cpp files
+# are kept in-tree but excluded from this list so they can be re-enabled
+# (by swapping pairs) when bisecting a GLES regression.
+GFXACCEL_SRCS = ../gfxaccel/rave_thunks.cpp ../gfxaccel/rave_dispatch.cpp \
+    ../gfxaccel/rave_engine.cpp ../gfxaccel/rave_draw_context.cpp \
+    ../gfxaccel/rave_gles_renderer.cpp \
+    ../gfxaccel/gl_thunks.cpp ../gfxaccel/gl_dispatch.cpp \
+    ../gfxaccel/gl_engine.cpp ../gfxaccel/gl_state.cpp \
+    ../gfxaccel/gl_gles_renderer.cpp \
+    ../gfxaccel/gles_compositor.cpp
+
 SRCS = ../main.cpp main_unix.cpp ../prefs.cpp ../prefs_items.cpp prefs_unix.cpp sys_unix.cpp \
     ../rom_patches.cpp ../rsrc_patches.cpp ../emul_op.cpp ../name_registry.cpp \
-    ../macos_util.cpp ../timer.cpp timer_unix.cpp ../xpram.cpp xpram_unix.cpp \
+    ../macos_util.cpp ../timer.cpp timer_unix.cpp timing_log.cpp ../xpram.cpp xpram_unix.cpp \
     ../adb.cpp ../sony.cpp ../disk.cpp ../cdrom.cpp ../scsi.cpp \
     ../gfxaccel.cpp ../video.cpp ../audio.cpp ../ether.cpp ../thunks.cpp \
     ../serial.cpp ../extfs.cpp disk_sparsebundle.cpp tinyxml2.cpp \
     about_window_unix.cpp ../user_strings.cpp user_strings_unix.cpp rpc_unix.cpp \
-    sshpty.c strlcpy.c $(XPLAT_SRCS) $(SYSSRCS) $(CPUSRCS) $(MONSRCS) $(SLIRP_SRCS)
+    sshpty.c strlcpy.c $(GFXACCEL_SRCS) \
+    $(XPLAT_SRCS) $(SYSSRCS) $(CPUSRCS) $(MONSRCS) $(SLIRP_SRCS)
 APP = SheepShaver
 APP_EXE = $(APP)$(EXEEXT)
 APP_APP = $(APP).app

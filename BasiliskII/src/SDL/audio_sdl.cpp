@@ -29,6 +29,7 @@
 #include "user_strings.h"
 #include "audio.h"
 #include "audio_defs.h"
+#include "timing_log.h"
 
 #define DEBUG 0
 #include "debug.h"
@@ -227,6 +228,14 @@ void audio_exit_stream()
 
 static void stream_func(void *arg, uint8 *stream, int stream_len)
 {
+	// Apply optional RT scheduling/affinity once on the SDL audio thread
+	// (SHEEPSHAVER_RT_AUDIO). SDL owns this thread, so we tag it on first call.
+	static bool rt_applied = false;
+	if (!rt_applied) {
+		rt_applied = true;
+		thread_set_realtime("audio");
+	}
+
 	if (AudioStatus.num_sources) {
 		// Trigger audio interrupt to get new buffer
 		D(bug("stream: triggering irq\n"));
@@ -243,8 +252,13 @@ static void stream_func(void *arg, uint8 *stream, int stream_len)
 			D(bug("stream: work_size %d\n", work_size));
 			if (work_size > stream_len)
 				work_size = stream_len;
-			if (work_size == 0)
+			if (work_size == 0) {
+				if (timing_log_active)
+					timing_log_audio("underrun", 0, stream_len, audio_sample_clock);
 				goto silence;
+			}
+			if (timing_log_active)
+				timing_log_audio("data", work_size, stream_len, audio_sample_clock);
 
 			// Send data to audio device
 			bool dbl = AudioStatus.channels == 2 &&
@@ -260,8 +274,11 @@ static void stream_func(void *arg, uint8 *stream, int stream_len)
 
 			D(bug("stream: data written\n"));
 
-		} else
+		} else {
+			if (timing_log_active && apple_stream_info == 0)
+				timing_log_audio("underrun", 0, stream_len, audio_sample_clock);
 			goto silence;
+		}
 
 	} else {
 
@@ -272,7 +289,15 @@ static void stream_func(void *arg, uint8 *stream, int stream_len)
 #if defined(BINCUE)
 	MixAudio_bincue(stream, stream_len);
 #endif
-	
+
+	// Advance the media clock by the frames the device just consumed. This is
+	// paced by the host audio hardware draining the buffer, so it is the true
+	// playback rate, free of host scheduler jitter.
+	{
+		int frame_bytes = (AudioStatus.sample_size >> 3) * AudioStatus.channels;
+		if (frame_bytes > 0)
+			audio_sample_clock += (uint64)stream_len / frame_bytes;
+	}
 }
 
 

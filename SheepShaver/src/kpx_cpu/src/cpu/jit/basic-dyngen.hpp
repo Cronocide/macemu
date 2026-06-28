@@ -49,6 +49,9 @@ static inline void dg_set_jmp_target_noflush(uint8 *jmp_addr, uint8 *addr)
 
 static inline void dg_set_jmp_target(uint8 *jmp_addr, uint8 *addr)
 {
+#if defined(__aarch64__)
+	const uint32 old_insn = *(uint32 *)jmp_addr;
+#endif
 	dg_set_jmp_target_noflush(jmp_addr, addr);
 #if defined(__powerpc__) || defined(__ppc__)
     // flush icache
@@ -59,11 +62,9 @@ static inline void dg_set_jmp_target(uint8 *jmp_addr, uint8 *addr)
     asm volatile ("isync" : : : "memory");
 #endif
 #if defined(__aarch64__)
-	asm volatile ("dc cvau, %0" :: "r"(jmp_addr) : "memory");
-	asm volatile ("dsb ish" ::: "memory");
-	asm volatile ("ic ivau, %0" :: "r"(jmp_addr) : "memory");
-	asm volatile ("dsb ish" ::: "memory");
-	asm volatile ("isb" ::: "memory");
+	if (*(uint32 *)jmp_addr == old_insn)
+		return;
+	flush_icache_range((unsigned long)jmp_addr, (unsigned long)(jmp_addr + sizeof(uint32)));
 #endif
 }
 

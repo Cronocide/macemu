@@ -40,6 +40,7 @@
 #include "user_strings.h"
 #include "audio.h"
 #include "audio_defs.h"
+#include "timing_log.h"
 
 #ifdef ENABLE_ESD
 #include <esd.h>
@@ -402,8 +403,14 @@ static void *stream_func(void *arg)
 				D(bug("stream: work_size %d\n", work_size));
 				if (work_size > sound_buffer_size)
 					work_size = sound_buffer_size;
-				if (work_size == 0)
+				if (work_size == 0) {
+					// Source active but no samples produced in time: underrun
+					if (timing_log_active)
+						timing_log_audio("underrun", 0, sound_buffer_size, audio_sample_clock);
 					goto silence;
+				}
+				if (timing_log_active)
+					timing_log_audio("data", work_size, sound_buffer_size, audio_sample_clock);
 
 				// Send data to DSP
 				if (work_size == sound_buffer_size && !little_endian)
@@ -420,8 +427,12 @@ static void *stream_func(void *arg)
 					write(audio_fd, last_buffer, sound_buffer_size);
 				}
 				D(bug("stream: data written\n"));
-			} else
+			} else {
+				// Source active but mixer produced no stream info: underrun
+				if (timing_log_active)
+					timing_log_audio("underrun", 0, sound_buffer_size, audio_sample_clock);
 				goto silence;
+			}
 
 		} else {
 

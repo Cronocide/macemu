@@ -22,20 +22,34 @@
 #ifndef JIT_TARGET_CACHE_H
 #define JIT_TARGET_CACHE_H
 
+static inline unsigned long get_icache_line_size(void)
+{
+	static unsigned long cache_line_size = 0;
+	if (cache_line_size == 0) {
+		unsigned long ctr_el0 = 0;
+		asm volatile ("mrs %0, ctr_el0" : "=r"(ctr_el0));
+		cache_line_size = 4UL << ((ctr_el0 >> 16) & 0xF);
+		if (cache_line_size == 0)
+			cache_line_size = 64;
+	}
+	return cache_line_size;
+}
+
 static inline void flush_icache_range(unsigned long start, unsigned long stop)
 {
+	if (stop <= start)
+		return;
+
+	const unsigned long cache_line_size = get_icache_line_size();
+	const unsigned long range_start = start & ~(cache_line_size - 1);
+	const unsigned long range_stop = (stop + cache_line_size - 1) & ~(cache_line_size - 1);
 	unsigned long addr;
-	unsigned long ctr_el0;
-	unsigned long cache_line_size;
 
-	asm volatile ("mrs %0, ctr_el0" : "=r"(ctr_el0));
-	cache_line_size = 4 << ((ctr_el0 >> 16) & 0xF);
-
-	for (addr = start & ~(cache_line_size - 1); addr < stop; addr += cache_line_size)
+	for (addr = range_start; addr < range_stop; addr += cache_line_size)
 		asm volatile ("dc cvau, %0" :: "r"(addr));
 	asm volatile ("dsb ish" ::: "memory");
 
-	for (addr = start & ~(cache_line_size - 1); addr < stop; addr += cache_line_size)
+	for (addr = range_start; addr < range_stop; addr += cache_line_size)
 		asm volatile ("ic ivau, %0" :: "r"(addr));
 	asm volatile ("dsb ish" ::: "memory");
 	asm volatile ("isb" ::: "memory");

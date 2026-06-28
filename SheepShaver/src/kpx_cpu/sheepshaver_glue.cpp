@@ -39,6 +39,8 @@
 #include "serial.h"
 #include "ether.h"
 #include "timer.h"
+#include "rave_engine.h"
+#include "gl_engine.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1198,6 +1200,123 @@ void sheepshaver_cpu::execute_native_op(uint32 selector)
 	case NATIVE_NAMED_CHECK_LOAD_INVOC:
 		named_check_load_invoc(gpr(3), gpr(4), gpr(5));
 		break;
+	case NATIVE_RAVE_DISPATCH: {
+		// Save critical PPC registers that re-entrant PPC code could corrupt.
+		// CFM callbacks invoked during DrawContextNew / TextureNew can re-enter
+		// the PPC emulator and trample lr/ctr/sp/r2 before we return.
+		uint32 saved_lr = lr();
+		uint32 saved_ctr = ctr();
+		uint32 saved_sp = gpr(1);
+		uint32 saved_r2 = gpr(2);
+		uint32 saved_pc = pc();
+
+		uint32 pre_subop = ReadMacInt32(rave_scratch_addr);
+
+		if (rave_logging_enabled && pre_subop >= 200 && pre_subop <= 207) {
+			printf("RAVE NATIVE_OP: subop=%d PC=0x%08x LR=0x%08x CTR=0x%08x SP=0x%08x R2=0x%08x\n",
+			       pre_subop, saved_pc, saved_lr, saved_ctr, saved_sp, saved_r2);
+		}
+
+		// PPC ABI: float args travel in FPRs. SetFloat(ctx, tag, value)
+		// has its float in fpr(1); marshal it back into r5 for the dispatcher.
+		if (pre_subop == 0) {  // kRaveDrawSetFloat
+			float fval = (float)fpr(1);
+			uint32 fbits;
+			memcpy(&fbits, &fval, sizeof(uint32));
+			gpr(5) = fbits;
+		}
+
+		uint32 rave_ret = RaveDispatch(gpr(3), gpr(4), gpr(5), gpr(6), gpr(7), gpr(8));
+		gpr(3) = rave_ret;
+
+		// GetFloat: caller expects the float result in fpr(1) as well as gpr(3).
+		if (pre_subop == 3) {  // kRaveDrawGetFloat
+			float fval;
+			memcpy(&fval, &rave_ret, sizeof(float));
+			fpr(1) = (double)fval;
+		}
+
+		if (lr() != saved_lr) {
+			if (rave_logging_enabled)
+				printf("RAVE: LR corrupted (0x%08x->0x%08x), restoring\n", saved_lr, lr());
+			lr() = saved_lr;
+		}
+		if (ctr() != saved_ctr) {
+			if (rave_logging_enabled)
+				printf("RAVE: CTR corrupted (0x%08x->0x%08x), restoring\n", saved_ctr, ctr());
+			ctr() = saved_ctr;
+		}
+		if (gpr(1) != saved_sp) {
+			if (rave_logging_enabled)
+				printf("RAVE: SP corrupted (0x%08x->0x%08x), restoring\n", saved_sp, gpr(1));
+			gpr(1) = saved_sp;
+		}
+		if (gpr(2) != saved_r2) {
+			if (rave_logging_enabled)
+				printf("RAVE: R2 corrupted (0x%08x->0x%08x), restoring\n", saved_r2, gpr(2));
+			gpr(2) = saved_r2;
+		}
+		break;
+	}
+	case NATIVE_OPENGL_DISPATCH: {
+		uint32 saved_lr = lr();
+		uint32 saved_ctr = ctr();
+		uint32 saved_sp = gpr(1);
+		uint32 saved_r2 = gpr(2);
+
+		uint32 sub_opcode = ReadMacInt32(gl_scratch_addr);
+
+		// Dispatch-table path: GL context's internal dispatch table puts
+		// the context index in r3 and shifts real GL args into r4..r10.
+		extern uint32_t gl_dt_flag_addr;
+		uint32 dt_flag = ReadMacInt32(gl_dt_flag_addr);
+		WriteMacInt32(gl_dt_flag_addr, 0);
+
+		uint32 arg_r3, arg_r4, arg_r5, arg_r6, arg_r7, arg_r8, arg_r9, arg_r10;
+		if (dt_flag) {
+			arg_r3 = gpr(4);  arg_r4 = gpr(5);  arg_r5 = gpr(6);
+			arg_r6 = gpr(7);  arg_r7 = gpr(8);  arg_r8 = gpr(9);
+			arg_r9 = gpr(10); arg_r10 = 0;
+		} else {
+			arg_r3 = gpr(3);  arg_r4 = gpr(4);  arg_r5 = gpr(5);
+			arg_r6 = gpr(6);  arg_r7 = gpr(7);  arg_r8 = gpr(8);
+			arg_r9 = gpr(9);  arg_r10 = gpr(10);
+		}
+
+		// PPC ABI: float/double args ride in FPR1..FPR13. Use the per-function
+		// signature table to know which args are floats and extract them
+		// alongside the GPR args. Floats are passed promoted to double in FPRs.
+		const GLFuncSignature& sig = gl_func_signatures[sub_opcode < GL_MAX_SUBOPCODE ? sub_opcode : 0];
+		uint32 float_bits[13] = {0};
+		int fpr_idx = 0;
+		for (int i = 0; i < sig.num_args && i < 8; i++) {
+			if (sig.float_mask & (1 << i)) {
+				float fval = (float)fpr(1 + fpr_idx);
+				memcpy(&float_bits[fpr_idx], &fval, 4);
+				fpr_idx++;
+			}
+		}
+
+		// Functions with 9+ args read additional args from the PPC stack.
+		// gl_ppc_sp captures the caller's stack frame at dispatch time;
+		// gl_ppc_stack_arg_offset compensates for the dispatch-table shift.
+		{
+			extern uint32_t gl_ppc_sp;
+			extern int gl_ppc_stack_arg_offset;
+			gl_ppc_sp = saved_sp;
+			gl_ppc_stack_arg_offset = dt_flag ? 1 : 0;
+		}
+
+		gpr(3) = GLDispatch(arg_r3, arg_r4, arg_r5, arg_r6,
+		                    arg_r7, arg_r8, arg_r9, arg_r10,
+		                    float_bits, fpr_idx);
+
+		lr() = saved_lr;
+		ctr() = saved_ctr;
+		if (gpr(1) != saved_sp) gpr(1) = saved_sp;
+		if (gpr(2) != saved_r2) gpr(2) = saved_r2;
+		break;
+	}
 	default:
 		printf("FATAL: NATIVE_OP called with bogus selector %d\n", selector);
 		QuitEmulator();
