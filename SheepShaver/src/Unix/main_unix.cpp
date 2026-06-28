@@ -978,6 +978,15 @@ int main(int argc, char **argv)
 	// Only use nogui preference if not passed as command line argument
 	if (use_gui == -1)
 		use_gui = !PrefsFindBool("nogui");
+	if (timing_log_active) {
+		char _mbuf[256];
+		snprintf(_mbuf, sizeof(_mbuf),
+			"\"ramsize_mb\":%d,\"gfx_accel\":%s,\"jit\":%s",
+			PrefsFindInt32("ramsize"),
+			PrefsFindBool("gfx_accel") ? "true" : "false",
+			PrefsFindBool("jit") ? "true" : "false");
+		timing_log_emit("meta", _mbuf);
+	}
 
 #if SDL_PLATFORM_MACOS && SDL_VERSION_ATLEAST(2,0,0)
 	// On Mac OS X hosts, SDL2 will create its own menu bar.  This is mostly OK,

@@ -30,6 +30,7 @@
 #include <pthread.h>
 
 #include "sysdeps.h"
+#include "timing_log.h"
 #include "gles_compositor.h"
 
 #include <GLES3/gl3.h>
@@ -295,27 +296,22 @@ int gles_compositor_has_overlay(void)
 
 void gles_compositor_composite_overlays(int out_w, int out_h)
 {
-    // #region agent log
-    {
+    if (timing_log_active) {
         static int _comp_log = 0;
         if (_comp_log < 30) {
             int hasOv = gles_compositor_has_overlay();
-            FILE *_f = fopen("/tmp/rave_debug_f04964.ndjson", "a");
-            if (_f) {
-                fprintf(_f, "{\"sessionId\":\"f04964\",\"hypothesisId\":\"Z18a,Z18e\","
-                    "\"location\":\"gles_compositor.cpp:composite_overlays\","
-                    "\"message\":\"compositor entry\","
-                    "\"data\":{\"hasOverlay\":%d,\"initialized\":%d,\"prog\":%u,\"outW\":%d,\"outH\":%d,"
-                    "\"slot0_active\":%d,\"slot0_tex\":%u,\"slot1_active\":%d,\"slot1_tex\":%u}}\n",
-                    hasOv, (int)s_initialized, s_blitProgram, out_w, out_h,
-                    (int)s_overlays[0].active, s_overlays[0].texture,
-                    (int)s_overlays[1].active, s_overlays[1].texture);
-                fclose(_f);
-            }
+            char _buf[320];
+            snprintf(_buf, sizeof(_buf),
+                "\"hyp\":\"Z18a,Z18e\",\"loc\":\"gles_compositor:composite_overlays\","
+                "\"hasOverlay\":%d,\"initialized\":%d,\"prog\":%u,\"outW\":%d,\"outH\":%d,"
+                "\"slot0_active\":%d,\"slot0_tex\":%u,\"slot1_active\":%d,\"slot1_tex\":%u",
+                hasOv, (int)s_initialized, s_blitProgram, out_w, out_h,
+                (int)s_overlays[0].active, s_overlays[0].texture,
+                (int)s_overlays[1].active, s_overlays[1].texture);
+            timing_log_emit("rave_dbg", _buf);
             _comp_log++;
         }
     }
-    // #endregion
 
     if (!gles_compositor_has_overlay()) return;
     if (!s_initialized && gles_compositor_init() != 0) return;
@@ -396,27 +392,22 @@ void gles_compositor_composite_overlays(int out_w, int out_h)
 
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
-        // #region agent log
-        {
+        if (timing_log_active) {
             static int _draw_log = 0;
             if (_draw_log < 20) {
                 GLenum err = glGetError();
-                FILE *_f = fopen("/tmp/rave_debug_f04964.ndjson", "a");
-                if (_f) {
-                    fprintf(_f, "{\"sessionId\":\"f04964\",\"hypothesisId\":\"Z18a,Z18d\","
-                        "\"location\":\"gles_compositor.cpp:after_draw\","
-                        "\"message\":\"compositor draw done\","
-                        "\"data\":{\"slot\":%d,\"tex\":%u,\"glError\":%u,"
-                        "\"ndcL\":%.3f,\"ndcR\":%.3f,\"ndcT\":%.3f,\"ndcB\":%.3f,"
-                        "\"uvU\":%.3f,\"uvV\":%.3f,\"fboBinding\":%d}}\n",
-                        i, ov->texture, (unsigned)err,
-                        ndcL, ndcR, ndcT, ndcB, uvU, uvV, saved.framebuffer);
-                    fclose(_f);
-                }
+                char _buf[320];
+                snprintf(_buf, sizeof(_buf),
+                    "\"hyp\":\"Z18a,Z18d\",\"loc\":\"gles_compositor:after_draw\","
+                    "\"slot\":%d,\"tex\":%u,\"glError\":%u,"
+                    "\"ndcL\":%.3f,\"ndcR\":%.3f,\"ndcT\":%.3f,\"ndcB\":%.3f,"
+                    "\"uvU\":%.3f,\"uvV\":%.3f,\"fboBinding\":%d",
+                    i, ov->texture, (unsigned)err,
+                    ndcL, ndcR, ndcT, ndcB, uvU, uvV, saved.framebuffer);
+                timing_log_emit("rave_dbg", _buf);
                 _draw_log++;
             }
         }
-        // #endregion
 
         glDisableVertexAttribArray(0);
         glDisableVertexAttribArray(1);

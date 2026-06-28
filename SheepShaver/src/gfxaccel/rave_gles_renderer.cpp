@@ -140,32 +140,24 @@ static void rave_perf_report(void)
 	rave_perf_window_start = now;
 }
 
-// #region agent log
-#include <sys/time.h>
-#define RAVE_DBG_LOG "/tmp/rave_debug_f04964.ndjson"
+// Route RAVE diagnostic events through the standard timing log.
+// Gated by rave_logging_enabled (set via gfx_accel_log pref) + timing_log_active.
 static void rave_dbg(const char *hyp, const char *loc, const char *msg,
                      const char *extra = nullptr) {
-	static int enabled = -1;
-	if (enabled < 0) {
-		const char *env = getenv("RAVE_DEBUG_NDJSON");
-		enabled = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
-	}
-	if (!enabled) return;
-	FILE *f = fopen(RAVE_DBG_LOG, "a");
-	if (!f) return;
-	struct timeval tv; gettimeofday(&tv, nullptr);
-	long long ts = (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+#if ACCEL_LOGGING_ENABLED
+	if (!rave_logging_enabled || !timing_log_active) return;
+	char _buf[512];
 	if (extra)
-		fprintf(f, "{\"sessionId\":\"f04964\",\"hypothesisId\":\"%s\",\"location\":\"%s\","
-		           "\"message\":\"%s\",\"data\":{%s},\"timestamp\":%lld}\n",
-		        hyp, loc, msg, extra, ts);
+		snprintf(_buf, sizeof(_buf),
+			"\"hyp\":\"%s\",\"loc\":\"%s\",\"msg\":\"%s\",\"data\":{%s}",
+			hyp, loc, msg, extra);
 	else
-		fprintf(f, "{\"sessionId\":\"f04964\",\"hypothesisId\":\"%s\",\"location\":\"%s\","
-		           "\"message\":\"%s\",\"data\":{},\"timestamp\":%lld}\n",
-		        hyp, loc, msg, ts);
-	fclose(f);
+		snprintf(_buf, sizeof(_buf),
+			"\"hyp\":\"%s\",\"loc\":\"%s\",\"msg\":\"%s\",\"data\":{}",
+			hyp, loc, msg);
+	timing_log_emit("rave_dbg", _buf);
+#endif
 }
-// #endregion
 
 // GL state save/restore (shared by RAVE render pass and GPU compositor)
 struct SavedGLState {
