@@ -402,6 +402,10 @@ int sheepshaver_cpu::compile1(codegen_context_t & cg_context)
 			dg.gen_invoke_T0((void (*)(uint32))NQD_fillrect);
 			status = COMPILE_CODE_OK;
 			break;
+		case NATIVE_QD_COPYMASK_PROBE:
+			dg.gen_invoke(NQD_copymask_probe);
+			status = COMPILE_CODE_OK;
+			break;
 		}
 		// Could we fully translate this NativeOp?
 		if (status == COMPILE_CODE_OK) {
@@ -1155,6 +1159,12 @@ void sheepshaver_cpu::execute_native_op(uint32 selector)
 		break;
 	case NATIVE_NQD_FILLRECT:
 		NQD_fillrect(gpr(3));
+		break;
+	case NATIVE_QD_COPYMASK_PROBE:
+		NQD_copymask_probe();
+		break;
+	case NATIVE_QD_COPYBITS:
+		gpr(0) = NQD_copybits(gpr(3), gpr(4), gpr(5), gpr(6), gpr(7), gpr(8));
 		break;
 	case NATIVE_SERIAL_NOTHING:
 	case NATIVE_SERIAL_OPEN:

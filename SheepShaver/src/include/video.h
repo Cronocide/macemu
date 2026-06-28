@@ -183,6 +183,8 @@ extern bool NQD_unknown_hook(uint32);
 extern void NQD_bitblt(uint32);
 extern void NQD_invrect(uint32);
 extern void NQD_fillrect(uint32);
+extern void NQD_copymask_probe(void);
+extern uint32 NQD_copybits(uint32 r3, uint32 r4, uint32 r5, uint32 r6, uint32 r7, uint32 r8);
 
 extern bool keyfile_valid;
 

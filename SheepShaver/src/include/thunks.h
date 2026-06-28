@@ -69,6 +69,8 @@ enum {
   NATIVE_GET_1_NAMED_RESOURCE,
   NATIVE_RAVE_DISPATCH,
   NATIVE_OPENGL_DISPATCH,
+  NATIVE_QD_COPYMASK_PROBE,  // InterfaceLib CopyMask intercept (counting probe)
+  NATIVE_QD_COPYBITS,        // InterfaceLib CopyBits fast-path (clips off-screen sprites)
   NATIVE_OP_MAX
 };
 

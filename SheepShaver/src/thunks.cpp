@@ -70,6 +70,8 @@ uint32 NativeOpcode(int selector)
 	case NATIVE_NQD_BITBLT:
 	case NATIVE_NQD_INVRECT:
 	case NATIVE_NQD_FILLRECT:
+	case NATIVE_QD_COPYMASK_PROBE:
+	case NATIVE_QD_COPYBITS:
 		opcode = POWERPC_NATIVE_OP(0, selector);
 		break;
   	case NATIVE_PATCH_NAME_REGISTRY:

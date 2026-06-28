@@ -23,6 +23,8 @@
 #include "prefs.h"
 #include "video.h"
 #include "video_defs.h"
+#include "thunks.h"
+#include "macos_util.h"
 
 #define DEBUG 0
 #include "debug.h"
@@ -65,6 +67,16 @@ static uint64 nqd_reject_mode[64] = {0};	// rejected-bitblt count by transfer mo
 static int nqd_last_kind = -1;				// 0=accel bitblt, 1=reject bitblt
 static int nqd_last_dx=0, nqd_last_dy=0, nqd_last_w=0, nqd_last_h=0;
 static int nqd_last_dbnd_l=0, nqd_last_dbnd_t=0, nqd_last_drb=0, nqd_last_mode=0, nqd_last_bpp=0;
+static uint64 nqd_hook_last_entry_us  = 0;
+static uint64 nqd_inter_hook_sum_us   = 0;
+static uint64 nqd_inter_hook_max_us   = 0;
+static uint64 nqd_inter_hook_n        = 0;
+static uint64 nqd_blit_off_screen_accel  = 0;
+static uint64 nqd_blit_off_screen_reject = 0;
+static uint64 nqd_reject_area_px      = 0;
+static uint64 nqd_accel_area_px       = 0;
+static uint64 nqd_copymask_count       = 0;
+static uint64 nqd_copymask_window_start = 0;
 
 static void nqd_blit_diag_report(void)
 {
@@ -85,16 +97,26 @@ static void nqd_blit_diag_report(void)
 			mp += snprintf(modes + mp, sizeof(modes) - mp, "%s%d:%llu",
 						   mp ? "," : "", m, (unsigned long long)nqd_reject_mode[m]);
 	}
-	printf("[nqd:blit] %.2fs | bitblt accel %llu reject %llu (to_screen %llu) | "
+	const uint64 avg_us = nqd_inter_hook_n ? nqd_inter_hook_sum_us / nqd_inter_hook_n : 0;
+	printf("[nqd:blit] %.2fs | bitblt accel %llu reject %llu (to_screen %llu off_screen accel %llu reject %llu) | "
 		   "fill accel %llu reject %llu | unknown(masked) %llu | reject_modes[%s]\n",
 		   elapsed / 1000000.0,
 		   (unsigned long long)nqd_blit_accel,
 		   (unsigned long long)nqd_blit_reject,
 		   (unsigned long long)nqd_blit_to_screen,
+		   (unsigned long long)nqd_blit_off_screen_accel,
+		   (unsigned long long)nqd_blit_off_screen_reject,
 		   (unsigned long long)nqd_fill_accel,
 		   (unsigned long long)nqd_fill_reject,
 		   (unsigned long long)nqd_unknown,
 		   modes);
+	printf("[nqd:blit]   inter-hook avg=%lluus max=%lluus n=%llu | "
+		   "reject_area=%.2fMpx accel_area=%.2fMpx\n",
+		   (unsigned long long)avg_us,
+		   (unsigned long long)nqd_inter_hook_max_us,
+		   (unsigned long long)nqd_inter_hook_n,
+		   nqd_reject_area_px / 1e6,
+		   nqd_accel_area_px  / 1e6);
 	if (nqd_last_kind >= 0)
 		printf("[nqd:blit]   last screen bitblt %s: dst(%d,%d) %dx%d destBounds(l=%d,t=%d) rowBytes=%d mode=%d bpp=%d\n",
 			   nqd_last_kind == 0 ? "ACCEL" : "REJECT",
@@ -106,6 +128,240 @@ static void nqd_blit_diag_report(void)
 	for (int m = 0; m < 64; m++) nqd_reject_mode[m] = 0;
 	nqd_last_kind = -1;
 	nqd_blit_window_start = now;
+	nqd_inter_hook_sum_us = nqd_inter_hook_max_us = nqd_inter_hook_n = 0;
+	nqd_blit_off_screen_accel = nqd_blit_off_screen_reject = 0;
+	nqd_reject_area_px = nqd_accel_area_px = 0;
+}
+
+// Called at the start of every NQD hook to measure time spent in the guest
+// between consecutive hook entries (proxy for guest-CPU blit cost).
+static inline void nqd_record_hook_entry(void)
+{
+	const uint64 now = GetTicks_usec();
+	if (nqd_hook_last_entry_us != 0) {
+		const uint64 delta = now - nqd_hook_last_entry_us;
+		nqd_inter_hook_sum_us += delta;
+		if (delta > nqd_inter_hook_max_us) nqd_inter_hook_max_us = delta;
+		nqd_inter_hook_n++;
+	}
+	nqd_hook_last_entry_us = now;
+}
+
+// Reset all nqd_diag counters and start a fresh window. Safe to call from a
+// signal handler (no locks held, all writes are to file-static variables on
+// the emulation thread).
+void nqd_blit_diag_reset(void)
+{
+	nqd_blit_window_start     = 0;
+	nqd_blit_accel            = nqd_blit_reject = nqd_blit_to_screen = 0;
+	nqd_fill_accel            = nqd_fill_reject  = nqd_unknown        = 0;
+	for (int m = 0; m < 64; m++) nqd_reject_mode[m] = 0;
+	nqd_last_kind             = -1;
+	nqd_hook_last_entry_us    = 0;
+	nqd_inter_hook_sum_us     = nqd_inter_hook_max_us = nqd_inter_hook_n = 0;
+	nqd_blit_off_screen_accel = nqd_blit_off_screen_reject = 0;
+	nqd_reject_area_px        = nqd_accel_area_px = 0;
+	nqd_copymask_count        = 0;
+	nqd_copymask_window_start = 0;
+}
+
+static void nqd_copymask_report(void)
+{
+	const uint64 now = GetTicks_usec();
+	if (nqd_copymask_window_start == 0) {
+		nqd_copymask_window_start = now;
+		return;
+	}
+	const uint64 elapsed = now - nqd_copymask_window_start;
+	if (elapsed < 2000000)
+		return;
+	printf("[nqd:copymask] %.2fs | CopyMask calls %llu (%.0f/s)\n",
+		   elapsed / 1000000.0,
+		   (unsigned long long)nqd_copymask_count,
+		   nqd_copymask_count / (elapsed / 1000000.0));
+	fflush(stdout);
+	nqd_copymask_count        = 0;
+	nqd_copymask_window_start = now;
+}
+
+void NQD_copymask_probe(void)
+{
+	if (!nqd_diag_enabled)
+		return;
+	nqd_copymask_count++;
+	nqd_copymask_report();
+}
+
+uint32 NQD_copybits(uint32 r3, uint32 r4, uint32 r5, uint32 r6, uint32 r7, uint32 r8)
+{
+    // Only handle srcCopy (mode 0)
+    if ((r7 & 0xFFFF) != 0)
+        return 1;
+
+    // Only handle masked blits; plain blits rely on port clipRgn/visRgn and
+    // color-table remapping that only the original CopyBits applies correctly.
+    if (r8 == 0)
+        return 1;
+
+    // Destination must be the Mac screen framebuffer
+    if (ReadMacInt32(r4 + 0) != screen_base)
+        return 1;
+
+    // Source must be an 8-bpp PixMap (rowBytes bit 15 set, pixelSize == 8)
+    if (!(ReadMacInt16(r3 + 4) & 0x8000))
+        return 1;
+    if (ReadMacInt16(r3 + 32) != 8)
+        return 1;
+
+    // Read source geometry
+    uint32 srcBase  = ReadMacInt32(r3 + 0);
+    int    srcRB    = ReadMacInt16(r3 + 4) & 0x3FFF;
+    int    srcBTop  = (int16)ReadMacInt16(r3 + 6);
+    int    srcBLeft = (int16)ReadMacInt16(r3 + 8);
+
+    // Read destination geometry
+    int    dstRB    = ReadMacInt16(r4 + 4) & 0x3FFF;
+    int    dstBTop  = (int16)ReadMacInt16(r4 + 6);
+    int    dstBLeft = (int16)ReadMacInt16(r4 + 8);
+    int    dstBBot  = (int16)ReadMacInt16(r4 + 10);
+    int    dstBRight= (int16)ReadMacInt16(r4 + 12);
+
+    // Read src and dst rects
+    int    srTop    = (int16)ReadMacInt16(r5 + 0);
+    int    srLeft   = (int16)ReadMacInt16(r5 + 2);
+    int    srBot    = (int16)ReadMacInt16(r5 + 4);
+    int    srRight  = (int16)ReadMacInt16(r5 + 6);
+
+    int    drTop    = (int16)ReadMacInt16(r6 + 0);
+    int    drLeft   = (int16)ReadMacInt16(r6 + 2);
+    int    drBot    = (int16)ReadMacInt16(r6 + 4);
+    int    drRight  = (int16)ReadMacInt16(r6 + 6);
+
+    // Only handle 1:1 scale
+    if ((srBot - srTop) != (drBot - drTop) || (srRight - srLeft) != (drRight - drLeft))
+        return 1;
+
+    // Clip destination rect to the screen bounds
+    int clipTop    = (drTop   > dstBTop)   ? drTop   : dstBTop;
+    int clipLeft   = (drLeft  > dstBLeft)  ? drLeft  : dstBLeft;
+    int clipBottom = (drBot   < dstBBot)   ? drBot   : dstBBot;
+    int clipRight  = (drRight < dstBRight) ? drRight : dstBRight;
+
+    if (clipTop >= clipBottom || clipLeft >= clipRight)
+        return 0;  // nothing visible — handled (no-op)
+
+    // Mapping from dst coords to src coords
+    int src_dx = srLeft - drLeft;
+    int src_dy = srTop  - drTop;
+
+    uint8 *src_host = (uint8 *)Mac2HostAddr(srcBase);
+    uint8 *dst_host = (uint8 *)Mac2HostAddr(ReadMacInt32(r4 + 0));
+
+    if (r8 == 0) {
+        // No mask region — plain clipped copy
+        int w = clipRight - clipLeft;
+        int dstOff = clipLeft - dstBLeft;
+        int srcOff = clipLeft + src_dx - srcBLeft;
+        for (int y = clipTop; y < clipBottom; y++) {
+            memcpy(dst_host + (y - dstBTop) * dstRB + dstOff,
+                   src_host + (y + src_dy - srcBTop) * srcRB + srcOff,
+                   w);
+        }
+        return 0;
+    }
+
+    // Dereference region handle: r8 is a Mac Handle (address of master pointer)
+    uint32 rgnPtr  = ReadMacInt32(r8);   // master pointer → Region struct
+    int    rgnSize = ReadMacInt16(rgnPtr + 0);
+    int    rgnTop  = (int16)ReadMacInt16(rgnPtr + 2);
+    int    rgnLeft = (int16)ReadMacInt16(rgnPtr + 4);
+    int    rgnBot  = (int16)ReadMacInt16(rgnPtr + 6);
+    int    rgnRight= (int16)ReadMacInt16(rgnPtr + 8);
+
+    // Further clip by region bounding box
+    if (rgnTop    > clipTop)    clipTop    = rgnTop;
+    if (rgnLeft   > clipLeft)   clipLeft   = rgnLeft;
+    if (rgnBot    < clipBottom) clipBottom = rgnBot;
+    if (rgnRight  < clipRight)  clipRight  = rgnRight;
+
+    if (clipTop >= clipBottom || clipLeft >= clipRight)
+        return 0;
+
+    // Precompute row offsets
+    int dstBaseOff = -dstBLeft;
+    int srcBaseOff = src_dx - srcBLeft;
+
+    if (rgnSize == 10) {
+        // Rectangular region — just clip + copy
+        int w = clipRight - clipLeft;
+        for (int y = clipTop; y < clipBottom; y++) {
+            memcpy(dst_host + (y - dstBTop) * dstRB + clipLeft + dstBaseOff,
+                   src_host + (y + src_dy - srcBTop) * srcRB + clipLeft + srcBaseOff,
+                   w);
+        }
+        return 0;
+    }
+
+    // Non-rectangular region: walk XOR-encoded span data.
+    // Format at rgnPtr+10: series of (y_value, x0, x1, …, 0x7FFF) entries,
+    // terminated by a 0x7FFF y_value.  x values are XOR-merged into active list.
+    static uint16 xbuf[64];
+    int nActive = 0;
+
+    uint32 p = rgnPtr + 10;
+    uint16 curY = ReadMacInt16(p);
+    if (curY == 0x7FFF)
+        return 0;  // empty region
+
+    while (curY != 0x7FFF) {
+        p += 2;
+        // XOR-merge x transitions for this y into the sorted active list
+        uint16 x;
+        while ((x = ReadMacInt16(p)) != 0x7FFF) {
+            p += 2;
+            // Find position; remove if duplicate (XOR), else insert sorted
+            int i;
+            for (i = 0; i < nActive; i++) {
+                if (xbuf[i] == x) {
+                    // Remove
+                    nActive--;
+                    for (int j = i; j < nActive; j++) xbuf[j] = xbuf[j + 1];
+                    goto xor_done;
+                }
+                if (xbuf[i] > x)
+                    break;
+            }
+            // Insert before position i
+            if (nActive < 64) {
+                for (int j = nActive; j > i; j--) xbuf[j] = xbuf[j - 1];
+                xbuf[i] = x;
+                nActive++;
+            }
+            xor_done:;
+        }
+        p += 2;  // skip 0x7FFF
+
+        uint16 nextY = ReadMacInt16(p);  // peek at next y boundary
+
+        // Blit rows in [curY, nextY) using current active spans
+        int yStart = ((int)curY  > clipTop)    ? (int)curY  : clipTop;
+        int yEnd   = ((int)nextY < clipBottom) ? (int)nextY : clipBottom;
+
+        for (int y = yStart; y < yEnd; y++) {
+            uint8 *drow = dst_host + (y - dstBTop) * dstRB + dstBaseOff;
+            uint8 *srow = src_host + (y + src_dy - srcBTop) * srcRB + srcBaseOff;
+            for (int s = 0; s + 1 < nActive; s += 2) {
+                int x1 = xbuf[s];     if (x1 < clipLeft)  x1 = clipLeft;
+                int x2 = xbuf[s + 1]; if (x2 > clipRight) x2 = clipRight;
+                if (x1 < x2)
+                    memcpy(drow + x1, srow + x1, x2 - x1);
+            }
+        }
+
+        curY = nextY;
+    }
+
+    return 0;  // handled
 }
 
 // Capture the geometry of a screen-targeted bitblt for the periodic sample line.
@@ -423,6 +679,9 @@ void NQD_fillrect(uint32 p)
 bool NQD_fillrect_hook(uint32 p)
 {
 	D(bug("accl_fillrect_hook %08x\n", p));
+
+	if (nqd_diag_enabled) nqd_record_hook_entry();
+
 	NQD_set_dirty_area(p);
 
 	// Check if we can accelerate this fillrect
@@ -516,6 +775,9 @@ void NQD_bitblt(uint32 p)
 bool NQD_bitblt_hook(uint32 p)
 {
 	D(bug("accl_draw_hook %08x\n", p));
+
+	if (nqd_diag_enabled) nqd_record_hook_entry();
+
 	NQD_set_dirty_area(p);
 
 	const bool to_screen = (ReadMacInt32(p + acclDestBaseAddr) == screen_base);
@@ -533,7 +795,11 @@ bool NQD_bitblt_hook(uint32 p)
 		WriteMacInt32(p + acclDrawProc, NativeTVECT(NATIVE_NQD_BITBLT));
 		if (nqd_diag_enabled) {
 			nqd_blit_accel++;
+			const int16 w = (int16)ReadMacInt16(p + acclDestRect + 6) - (int16)ReadMacInt16(p + acclDestRect + 2);
+			const int16 h = (int16)ReadMacInt16(p + acclDestRect + 4) - (int16)ReadMacInt16(p + acclDestRect + 0);
+			if (w > 0 && h > 0) nqd_accel_area_px += (uint64)w * h;
 			if (to_screen) { nqd_blit_to_screen++; nqd_blit_diag_sample(p, 0); }
+			else           { nqd_blit_off_screen_accel++; }
 			nqd_blit_diag_report();
 		}
 		return true;
@@ -542,7 +808,11 @@ bool NQD_bitblt_hook(uint32 p)
 		nqd_blit_reject++;
 		const int mode = (int)ReadMacInt32(p + acclTransferMode);
 		if (mode >= 0 && mode < 64) nqd_reject_mode[mode]++;
+		const int16 w = (int16)ReadMacInt16(p + acclDestRect + 6) - (int16)ReadMacInt16(p + acclDestRect + 2);
+		const int16 h = (int16)ReadMacInt16(p + acclDestRect + 4) - (int16)ReadMacInt16(p + acclDestRect + 0);
+		if (w > 0 && h > 0) nqd_reject_area_px += (uint64)w * h;
 		if (to_screen) { nqd_blit_to_screen++; nqd_blit_diag_sample(p, 1); }
+		else           { nqd_blit_off_screen_reject++; }
 		nqd_blit_diag_report();
 	}
 	return false;
@@ -636,4 +906,94 @@ void VideoInstallAccel(void)
 		// so it's correct to call from this same accRun-driven entry point.
 		GLInstallHooks();
 	}
+
+	// Patch InterfaceLib CopyBits TVECT.  When a masked sprite clips the screen
+	// edge, QuickDraw bypasses NQD and calls ROM StdBits (emulated PPC, slow).
+	// Thunk layout (48 bytes): NATIVE_QD_COPYBITS sets GPR(0)=0 (handled) or 1
+	// (fall through); cmpwi/beq branches to blr or reloads orig code/TOC and bctr.
+	//   [+0]  NATIVE_OP(NATIVE_QD_COPYBITS)
+	//   [+4]  cmpwi r0,0    [+8]  beq +28
+	//   [+12] lis r12,HI    [+16] ori r12,r12,LO
+	//   [+20] lwz r0,0(r12) [+24] lwz r2,4(r12)
+	//   [+28] mtctr r0      [+32] bctr
+	//   [+36] blr  (.done)
+	//   [+40] saved code ptr  [+44] saved TOC
+#if EMULATED_PPC
+	{
+		static bool copybits_patched = false;
+		if (!copybits_patched) {
+			uint32 cb_tvect = FindLibSymbol("\014InterfaceLib", "\010CopyBits");
+			if (cb_tvect != 0) {
+				uint32 orig_code = ReadMacInt32(cb_tvect + 0);
+				uint32 orig_toc  = ReadMacInt32(cb_tvect + 4);
+
+				uint32 base  = SheepMem::ReserveProc(48);
+				uint32 saved = base + 40;
+
+				WriteMacInt32(saved + 0, orig_code);
+				WriteMacInt32(saved + 4, orig_toc);
+
+				WriteMacInt32(base +  0, NativeOpcode(NATIVE_QD_COPYBITS));
+				WriteMacInt32(base +  4, 0x2C000000);                              // cmpwi r0, 0
+				WriteMacInt32(base +  8, 0x4182001C);                              // beq +28
+				WriteMacInt32(base + 12, 0x3D800000 | ((saved >> 16) & 0xFFFF));   // lis r12, HI
+				WriteMacInt32(base + 16, 0x618C0000 | (saved & 0xFFFF));            // ori r12,r12,LO
+				WriteMacInt32(base + 20, 0x800C0000);                              // lwz r0, 0(r12)
+				WriteMacInt32(base + 24, 0x804C0004);                              // lwz r2, 4(r12)
+				WriteMacInt32(base + 28, 0x7C0903A6);                              // mtctr r0
+				WriteMacInt32(base + 32, 0x4E800420);                              // bctr
+				WriteMacInt32(base + 36, 0x4E800020);                              // blr
+
+				WriteMacInt32(cb_tvect + 0, base);
+				copybits_patched = true;
+				printf("[nqd] CopyBits TVECT at 0x%08x patched; fast-path thunk at 0x%08x (orig 0x%08x)\n",
+				       cb_tvect, base, orig_code);
+				fflush(stdout);
+			} else {
+				printf("[nqd] WARNING: CopyBits not found in InterfaceLib; fast-path not installed\n");
+				fflush(stdout);
+			}
+		}
+	}
+#endif /* EMULATED_PPC */
+
+	// Patch InterfaceLib CopyMask TVECT to count calls under nqd_diag.
+	// Thunk (36 bytes): NATIVE_QD_COPYMASK_PROBE, then lis/ori/lwz/lwz/mtctr/bctr
+	// to original; saved code ptr+TOC at [+28]/[+32].
+#if EMULATED_PPC
+	if (PrefsFindBool("nqd_diag")) {
+		static bool copymask_patched = false;
+		if (!copymask_patched) {
+			uint32 cm_tvect = FindLibSymbol("\014InterfaceLib", "\010CopyMask");
+			if (cm_tvect != 0) {
+				uint32 orig_code = ReadMacInt32(cm_tvect + 0);
+				uint32 orig_toc  = ReadMacInt32(cm_tvect + 4);
+
+				uint32 base = SheepMem::ReserveProc(36);
+				uint32 saved = base + 28;
+
+				WriteMacInt32(saved + 0, orig_code);
+				WriteMacInt32(saved + 4, orig_toc);
+
+				WriteMacInt32(base +  0, NativeOpcode(NATIVE_QD_COPYMASK_PROBE));
+				WriteMacInt32(base +  4, 0x3D800000 | ((saved >> 16) & 0xFFFF));  // lis r12, HI
+				WriteMacInt32(base +  8, 0x618C0000 | (saved & 0xFFFF));           // ori r12,r12,LO
+				WriteMacInt32(base + 12, 0x800C0000);                               // lwz r0, 0(r12)
+				WriteMacInt32(base + 16, 0x804C0004);                               // lwz r2, 4(r12)
+				WriteMacInt32(base + 20, 0x7C0903A6);                               // mtctr r0
+				WriteMacInt32(base + 24, 0x4E800420);                               // bctr
+
+				WriteMacInt32(cm_tvect + 0, base);
+
+				copymask_patched = true;
+				printf("[nqd] CopyMask TVECT at 0x%08x patched; probe thunk at 0x%08x (orig code 0x%08x)\n",
+					   cm_tvect, base, orig_code);
+				fflush(stdout);
+			} else {
+				printf("[nqd] WARNING: CopyMask not found in InterfaceLib; probe not installed\n");
+				fflush(stdout);
+			}
+		}
+	}
+#endif /* EMULATED_PPC */
 }
