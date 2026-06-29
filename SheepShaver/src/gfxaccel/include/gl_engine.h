@@ -1067,6 +1067,15 @@ struct GLMinmaxState {
  *  This is the native-side representation of an OpenGL context.
  *  Metal types use void* bridges to keep this header C++ compatible.
  */
+
+// Dirty bits for uniform_dirty in GLContext — set when state changes,
+// cleared by UploadUniforms() after the corresponding group is uploaded.
+#define GL_UDIRTY_MATRIX    (1u<<0)  // MVP / MV / normal matrix
+#define GL_UDIRTY_LIGHTING  (1u<<1)  // lights, material, light-model ambient, lighting_enabled
+#define GL_UDIRTY_FOG       (1u<<2)  // fog enable/mode/params/color
+#define GL_UDIRTY_MISC      (1u<<3)  // alpha test, texenv, normalize, has_texture
+#define GL_UDIRTY_ALL       (0xFu)
+
 struct GLContext {
     // ---- Matrix stacks ----
     float    modelview_stack[32][16];   // 32 deep, 4x4 floats
@@ -1326,6 +1335,11 @@ struct GLContext {
 
     // ---- Error ----
     uint32_t last_error;               // GLenum: GL_NO_ERROR, etc.
+
+    // ---- Uniform dirty tracking ----
+    // Set by state setters; cleared by UploadUniforms() after each group upload.
+    // Initialized to GL_UDIRTY_ALL so the first DrawPreparedVertices uploads everything.
+    uint32_t uniform_dirty;
 };
 
 

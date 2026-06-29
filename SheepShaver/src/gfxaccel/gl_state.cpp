@@ -685,6 +685,7 @@ void NativeGLMatrixMode(GLContext *ctx, uint32_t mode)
 void NativeGLLoadIdentity(GLContext *ctx)
 {
 	mat4_identity(gl_get_current_matrix(ctx));
+	ctx->uniform_dirty |= GL_UDIRTY_MATRIX;
 }
 
 void NativeGLLoadMatrixf(GLContext *ctx, uint32_t mac_ptr)
@@ -692,11 +693,11 @@ void NativeGLLoadMatrixf(GLContext *ctx, uint32_t mac_ptr)
 	float *m = gl_get_current_matrix(ctx);
 	for (int i = 0; i < 16; i++)
 		m[i] = ReadMacFloat(mac_ptr + i * 4);
+	ctx->uniform_dirty |= GL_UDIRTY_MATRIX;
 }
 
 void NativeGLLoadMatrixd(GLContext *ctx, uint32_t mac_ptr)
 {
-	// Read 16 doubles (8 bytes each), convert to float
 	float *m = gl_get_current_matrix(ctx);
 	for (int i = 0; i < 16; i++) {
 		uint32 hi = ReadMacInt32(mac_ptr + i * 8);
@@ -706,6 +707,7 @@ void NativeGLLoadMatrixd(GLContext *ctx, uint32_t mac_ptr)
 		memcpy(&d, &bits, sizeof(double));
 		m[i] = (float)d;
 	}
+	ctx->uniform_dirty |= GL_UDIRTY_MATRIX;
 }
 
 void NativeGLMultMatrixf(GLContext *ctx, uint32_t mac_ptr)
@@ -715,6 +717,7 @@ void NativeGLMultMatrixf(GLContext *ctx, uint32_t mac_ptr)
 		tmp[i] = ReadMacFloat(mac_ptr + i * 4);
 	float *m = gl_get_current_matrix(ctx);
 	mat4_multiply(m, m, tmp);
+	ctx->uniform_dirty |= GL_UDIRTY_MATRIX;
 }
 
 void NativeGLMultMatrixd(GLContext *ctx, uint32_t mac_ptr)
@@ -730,6 +733,7 @@ void NativeGLMultMatrixd(GLContext *ctx, uint32_t mac_ptr)
 	}
 	float *m = gl_get_current_matrix(ctx);
 	mat4_multiply(m, m, tmp);
+	ctx->uniform_dirty |= GL_UDIRTY_MATRIX;
 }
 
 void NativeGLPushMatrix(GLContext *ctx)
@@ -740,11 +744,11 @@ void NativeGLPushMatrix(GLContext *ctx)
 		ctx->last_error = GL_STACK_OVERFLOW;
 		return;
 	}
-	// Copy current top to new top
 	float *cur = gl_get_current_matrix(ctx);
 	(*depth)++;
 	float *top = gl_get_current_matrix(ctx);
 	mat4_copy(top, cur);
+	ctx->uniform_dirty |= GL_UDIRTY_MATRIX;
 }
 
 void NativeGLPopMatrix(GLContext *ctx)
@@ -755,41 +759,49 @@ void NativeGLPopMatrix(GLContext *ctx)
 		return;
 	}
 	(*depth)--;
+	ctx->uniform_dirty |= GL_UDIRTY_MATRIX;
 }
 
 void NativeGLRotatef(GLContext *ctx, float angle, float x, float y, float z)
 {
 	mat4_rotate(gl_get_current_matrix(ctx), angle, x, y, z);
+	ctx->uniform_dirty |= GL_UDIRTY_MATRIX;
 }
 
 void NativeGLRotated(GLContext *ctx, double angle, double x, double y, double z)
 {
 	mat4_rotate(gl_get_current_matrix(ctx), (float)angle, (float)x, (float)y, (float)z);
+	ctx->uniform_dirty |= GL_UDIRTY_MATRIX;
 }
 
 void NativeGLTranslatef(GLContext *ctx, float x, float y, float z)
 {
 	mat4_translate(gl_get_current_matrix(ctx), x, y, z);
+	ctx->uniform_dirty |= GL_UDIRTY_MATRIX;
 }
 
 void NativeGLTranslated(GLContext *ctx, double x, double y, double z)
 {
 	mat4_translate(gl_get_current_matrix(ctx), (float)x, (float)y, (float)z);
+	ctx->uniform_dirty |= GL_UDIRTY_MATRIX;
 }
 
 void NativeGLScalef(GLContext *ctx, float x, float y, float z)
 {
 	mat4_scale(gl_get_current_matrix(ctx), x, y, z);
+	ctx->uniform_dirty |= GL_UDIRTY_MATRIX;
 }
 
 void NativeGLScaled(GLContext *ctx, double x, double y, double z)
 {
 	mat4_scale(gl_get_current_matrix(ctx), (float)x, (float)y, (float)z);
+	ctx->uniform_dirty |= GL_UDIRTY_MATRIX;
 }
 
 void NativeGLFrustum(GLContext *ctx, double l, double r, double b, double t, double n, double f)
 {
 	mat4_frustum(gl_get_current_matrix(ctx), l, r, b, t, n, f);
+	ctx->uniform_dirty |= GL_UDIRTY_MATRIX;
 }
 
 void NativeGLOrtho(GLContext *ctx, double l, double r, double b, double t, double n, double f)
@@ -801,6 +813,7 @@ void NativeGLOrtho(GLContext *ctx, double l, double r, double b, double t, doubl
 	// which are not flipped — the 3D camera setup naturally produces
 	// correct Metal-space orientation.
 	mat4_ortho(gl_get_current_matrix(ctx), l, r, t, b, n, f);
+	ctx->uniform_dirty |= GL_UDIRTY_MATRIX;
 }
 
 
@@ -893,6 +906,20 @@ static void gl_set_cap(GLContext *ctx, uint32_t cap, bool value)
 			printf("GL: unhandled cap 0x%X in enable/disable\n", cap);
 		break;
 	}
+
+	// Mark uniform groups dirty for caps that affect shaders.
+	switch (cap) {
+	case GL_LIGHTING:       ctx->uniform_dirty |= GL_UDIRTY_LIGHTING | GL_UDIRTY_MISC; break;
+	case GL_FOG:            ctx->uniform_dirty |= GL_UDIRTY_FOG; break;
+	case GL_ALPHA_TEST:     ctx->uniform_dirty |= GL_UDIRTY_MISC; break;
+	case GL_NORMALIZE:      ctx->uniform_dirty |= GL_UDIRTY_MISC; break;
+	case GL_TEXTURE_2D:     ctx->uniform_dirty |= GL_UDIRTY_MISC; break;
+	case GL_COLOR_MATERIAL: ctx->uniform_dirty |= GL_UDIRTY_LIGHTING; break;
+	default:
+		if (cap >= GL_LIGHT0 && cap < GL_LIGHT0 + 8)
+			ctx->uniform_dirty |= GL_UDIRTY_LIGHTING;
+		break;
+	}
 }
 
 void NativeGLEnable(GLContext *ctx, uint32_t cap)
@@ -967,6 +994,7 @@ void NativeGLAlphaFunc(GLContext *ctx, uint32_t func, float ref)
 {
 	ctx->alpha_func = func;
 	ctx->alpha_ref  = ref;
+	ctx->uniform_dirty |= GL_UDIRTY_MISC;
 }
 
 void NativeGLStencilFunc(GLContext *ctx, uint32_t func, int32_t ref, uint32_t mask)
@@ -1149,6 +1177,7 @@ void NativeGLLightf(GLContext *ctx, uint32_t light, uint32_t pname, float param)
 	case GL_QUADRATIC_ATTENUATION: l.quadratic_attenuation = param; break;
 	default: ctx->last_error = GL_INVALID_ENUM; break;
 	}
+	ctx->uniform_dirty |= GL_UDIRTY_LIGHTING;
 }
 
 void NativeGLLightfv(GLContext *ctx, uint32_t light, uint32_t pname, uint32_t mac_ptr)
@@ -1203,11 +1232,12 @@ void NativeGLLightfv(GLContext *ctx, uint32_t light, uint32_t pname, uint32_t ma
 	case GL_QUADRATIC_ATTENUATION: l.quadratic_attenuation = ReadMacFloat(mac_ptr); break;
 	default: ctx->last_error = GL_INVALID_ENUM; break;
 	}
+	ctx->uniform_dirty |= GL_UDIRTY_LIGHTING;
 }
 
 void NativeGLLighti(GLContext *ctx, uint32_t light, uint32_t pname, int32_t param)
 {
-	NativeGLLightf(ctx, light, pname, (float)param);
+	NativeGLLightf(ctx, light, pname, (float)param); // dirty bit set in NativeGLLightf
 }
 
 void NativeGLLightiv(GLContext *ctx, uint32_t light, uint32_t pname, uint32_t mac_ptr)
@@ -1240,6 +1270,7 @@ void NativeGLLightiv(GLContext *ctx, uint32_t light, uint32_t pname, uint32_t ma
 	case GL_QUADRATIC_ATTENUATION: l.quadratic_attenuation = vals[0]; break;
 	default: ctx->last_error = GL_INVALID_ENUM; break;
 	}
+	ctx->uniform_dirty |= GL_UDIRTY_LIGHTING;
 }
 
 void NativeGLLightModelf(GLContext *ctx, uint32_t pname, float param)
@@ -1249,6 +1280,7 @@ void NativeGLLightModelf(GLContext *ctx, uint32_t pname, float param)
 	case GL_LIGHT_MODEL_TWO_SIDE:    ctx->light_model_two_side = (param != 0.0f); break;
 	default: ctx->last_error = GL_INVALID_ENUM; break;
 	}
+	ctx->uniform_dirty |= GL_UDIRTY_LIGHTING;
 }
 
 void NativeGLLightModelfv(GLContext *ctx, uint32_t pname, uint32_t mac_ptr)
@@ -1266,11 +1298,12 @@ void NativeGLLightModelfv(GLContext *ctx, uint32_t pname, uint32_t mac_ptr)
 		break;
 	default: ctx->last_error = GL_INVALID_ENUM; break;
 	}
+	ctx->uniform_dirty |= GL_UDIRTY_LIGHTING;
 }
 
 void NativeGLLightModeli(GLContext *ctx, uint32_t pname, int32_t param)
 {
-	NativeGLLightModelf(ctx, pname, (float)param);
+	NativeGLLightModelf(ctx, pname, (float)param); // dirty bit set in NativeGLLightModelf
 }
 
 void NativeGLLightModeliv(GLContext *ctx, uint32_t pname, uint32_t mac_ptr)
@@ -1278,6 +1311,7 @@ void NativeGLLightModeliv(GLContext *ctx, uint32_t pname, uint32_t mac_ptr)
 	if (pname == GL_LIGHT_MODEL_AMBIENT) {
 		for (int i = 0; i < 4; i++)
 			ctx->light_model_ambient[i] = (float)(int32_t)ReadMacInt32(mac_ptr + i * 4);
+		ctx->uniform_dirty |= GL_UDIRTY_LIGHTING;
 	} else {
 		NativeGLLightModeli(ctx, pname, (int32_t)ReadMacInt32(mac_ptr));
 	}
@@ -1316,6 +1350,7 @@ static void gl_set_material_fv(GLContext *ctx, uint32_t face, uint32_t pname, co
 			ctx->last_error = GL_INVALID_ENUM; break;
 		}
 	}
+	ctx->uniform_dirty |= GL_UDIRTY_LIGHTING;
 }
 
 void NativeGLMaterialf(GLContext *ctx, uint32_t face, uint32_t pname, float param)
@@ -1351,6 +1386,7 @@ void NativeGLColorMaterial(GLContext *ctx, uint32_t face, uint32_t mode)
 {
 	ctx->color_material_face = face;
 	ctx->color_material_mode = mode;
+	ctx->uniform_dirty |= GL_UDIRTY_LIGHTING;
 }
 
 
@@ -1367,6 +1403,7 @@ void NativeGLFogf(GLContext *ctx, uint32_t pname, float param)
 	case GL_FOG_MODE:    ctx->fog_mode    = (uint32_t)param; break;
 	default: ctx->last_error = GL_INVALID_ENUM; break;
 	}
+	ctx->uniform_dirty |= GL_UDIRTY_FOG;
 }
 
 void NativeGLFogfv(GLContext *ctx, uint32_t pname, uint32_t mac_ptr)
@@ -1374,8 +1411,9 @@ void NativeGLFogfv(GLContext *ctx, uint32_t pname, uint32_t mac_ptr)
 	if (pname == GL_FOG_COLOR) {
 		for (int i = 0; i < 4; i++)
 			ctx->fog_color[i] = ReadMacFloat(mac_ptr + i * 4);
+		ctx->uniform_dirty |= GL_UDIRTY_FOG;
 	} else {
-		NativeGLFogf(ctx, pname, ReadMacFloat(mac_ptr));
+		NativeGLFogf(ctx, pname, ReadMacFloat(mac_ptr)); // dirty bit set in NativeGLFogf
 	}
 }
 
@@ -1383,8 +1421,9 @@ void NativeGLFogi(GLContext *ctx, uint32_t pname, int32_t param)
 {
 	if (pname == GL_FOG_MODE) {
 		ctx->fog_mode = (uint32_t)param;
+		ctx->uniform_dirty |= GL_UDIRTY_FOG;
 	} else {
-		NativeGLFogf(ctx, pname, (float)param);
+		NativeGLFogf(ctx, pname, (float)param); // dirty bit set in NativeGLFogf
 	}
 }
 
@@ -1393,8 +1432,9 @@ void NativeGLFogiv(GLContext *ctx, uint32_t pname, uint32_t mac_ptr)
 	if (pname == GL_FOG_COLOR) {
 		for (int i = 0; i < 4; i++)
 			ctx->fog_color[i] = (float)(int32_t)ReadMacInt32(mac_ptr + i * 4);
+		ctx->uniform_dirty |= GL_UDIRTY_FOG;
 	} else {
-		NativeGLFogi(ctx, pname, (int32_t)ReadMacInt32(mac_ptr));
+		NativeGLFogi(ctx, pname, (int32_t)ReadMacInt32(mac_ptr)); // dirty bit set in NativeGLFogi
 	}
 }
 
@@ -1408,6 +1448,7 @@ void NativeGLTexEnvf(GLContext *ctx, uint32_t target, uint32_t pname, float para
 	if (target != GL_TEXTURE_ENV) return;
 	if (pname == GL_TEXTURE_ENV_MODE)
 		ctx->tex_units[ctx->active_texture].env_mode = (int)param;
+	ctx->uniform_dirty |= GL_UDIRTY_MISC;
 }
 
 void NativeGLTexEnvfv(GLContext *ctx, uint32_t target, uint32_t pname, uint32_t mac_ptr)
@@ -1419,6 +1460,7 @@ void NativeGLTexEnvfv(GLContext *ctx, uint32_t target, uint32_t pname, uint32_t 
 	} else if (pname == GL_TEXTURE_ENV_MODE) {
 		ctx->tex_units[ctx->active_texture].env_mode = (int)ReadMacFloat(mac_ptr);
 	}
+	ctx->uniform_dirty |= GL_UDIRTY_MISC;
 }
 
 void NativeGLTexEnvi(GLContext *ctx, uint32_t target, uint32_t pname, int32_t param)
@@ -1426,6 +1468,7 @@ void NativeGLTexEnvi(GLContext *ctx, uint32_t target, uint32_t pname, int32_t pa
 	if (target != GL_TEXTURE_ENV) return;
 	if (pname == GL_TEXTURE_ENV_MODE)
 		ctx->tex_units[ctx->active_texture].env_mode = param;
+	ctx->uniform_dirty |= GL_UDIRTY_MISC;
 }
 
 void NativeGLTexEnviv(GLContext *ctx, uint32_t target, uint32_t pname, uint32_t mac_ptr)
@@ -1437,6 +1480,7 @@ void NativeGLTexEnviv(GLContext *ctx, uint32_t target, uint32_t pname, uint32_t 
 	} else if (pname == GL_TEXTURE_ENV_MODE) {
 		ctx->tex_units[ctx->active_texture].env_mode = (int32_t)ReadMacInt32(mac_ptr);
 	}
+	ctx->uniform_dirty |= GL_UDIRTY_MISC;
 }
 
 
@@ -1953,6 +1997,8 @@ void NativeGLPopAttrib(GLContext *ctx)
 		ctx->matrix_mode = entry.saved_matrix_mode;
 		memcpy(ctx->clip_plane_enabled, entry.saved_clip_plane_enabled, 6 * sizeof(bool));
 	}
+	// PopAttrib may restore any combination of state; mark everything dirty.
+	ctx->uniform_dirty |= GL_UDIRTY_ALL;
 }
 
 // Client attrib stacks -- simplified, stores vertex array pointers
@@ -2009,6 +2055,8 @@ void NativeGLPopClientAttrib(GLContext *ctx)
 void GLContextInit(GLContext *ctx)
 {
 	memset(ctx, 0, sizeof(GLContext));
+
+	ctx->uniform_dirty = GL_UDIRTY_ALL; // upload everything on first draw
 
 	// Matrix stacks: load identity
 	mat4_identity(ctx->modelview_stack[0]);
@@ -2269,6 +2317,7 @@ void NativeGLBindTexture(GLContext *ctx, uint32_t target, uint32_t texture)
 		ctx->tex_units[ctx->active_texture].bound_texture_2d = texture;
 	else if (target == GL_TEXTURE_1D)
 		ctx->tex_units[ctx->active_texture].bound_texture_1d = texture;
+	ctx->uniform_dirty |= GL_UDIRTY_MISC;
 }
 
 

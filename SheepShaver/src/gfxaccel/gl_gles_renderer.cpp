@@ -817,68 +817,73 @@ static void ResizeFBO(GLGLESState *gs, int w, int h)
 
 static void UploadUniforms(GLContext *ctx, GLGLESState *gs)
 {
-	const float *mv = ctx->modelview_stack[ctx->modelview_depth];
-	const float *proj = ctx->projection_stack[ctx->projection_depth];
-	float mvp[16];
-	mat4_multiply(mvp, proj, mv);
+	const uint32_t dirty = ctx->uniform_dirty;
+	ctx->uniform_dirty = 0;  // consume all dirty bits upfront
 
-	float nm[9];
-	compute_normal_matrix(nm, mv);
-
-	glUniformMatrix4fv(gs->loc_mvp_matrix, 1, GL_FALSE, mvp);
-	glUniformMatrix4fv(gs->loc_modelview_matrix, 1, GL_FALSE, mv);
-	glUniformMatrix3fv(gs->loc_normal_matrix, 1, GL_FALSE, nm);
-
-	glUniform1i(gs->loc_lighting_enabled, ctx->lighting_enabled ? 1 : 0);
-	glUniform1i(gs->loc_normalize_enabled, ctx->normalize ? 1 : 0);
-	glUniform1i(gs->loc_fog_enabled, ctx->fog_enabled ? 1 : 0);
-	glUniform1i(gs->loc_fog_mode, ctx->fog_enabled ? GLFogModeToShader(ctx->fog_mode) : 0);
-	glUniform1f(gs->loc_fog_start, ctx->fog_start);
-	glUniform1f(gs->loc_fog_end, ctx->fog_end);
-	glUniform1f(gs->loc_fog_density, ctx->fog_density);
-
-	int texUnit = ctx->active_texture;
-	glUniform1i(gs->loc_texenv_mode, GLTexEnvModeToShader(ctx->tex_units[texUnit].env_mode));
-	glUniform4fv(gs->loc_texenv_color, 1, ctx->tex_units[texUnit].env_color);
-
-	if (ctx->fog_enabled) {
-		glUniform4fv(gs->loc_fog_color, 1, ctx->fog_color);
-	} else {
-		float fc[4] = { 0, 0, 0, -1.0f };
-		glUniform4fv(gs->loc_fog_color, 1, fc);
+	if (dirty & GL_UDIRTY_MATRIX) {
+		const float *mv = ctx->modelview_stack[ctx->modelview_depth];
+		const float *proj = ctx->projection_stack[ctx->projection_depth];
+		float mvp[16];
+		mat4_multiply(mvp, proj, mv);
+		float nm[9];
+		compute_normal_matrix(nm, mv);
+		glUniformMatrix4fv(gs->loc_mvp_matrix, 1, GL_FALSE, mvp);
+		glUniformMatrix4fv(gs->loc_modelview_matrix, 1, GL_FALSE, mv);
+		glUniformMatrix3fv(gs->loc_normal_matrix, 1, GL_FALSE, nm);
 	}
 
-	glUniform1i(gs->loc_alpha_test_enabled, ctx->alpha_test ? 1 : 0);
-	glUniform1i(gs->loc_alpha_func, GLAlphaFuncToShader(ctx->alpha_func));
-	glUniform1f(gs->loc_alpha_ref, ctx->alpha_ref);
-
-	bool hasTex = ctx->tex_units[texUnit].enabled_2d && ctx->tex_units[texUnit].bound_texture_2d != 0;
-	glUniform1i(gs->loc_has_texture, hasTex ? 1 : 0);
-
-	for (int i = 0; i < 8; i++) {
-		const GLLight &L = ctx->lights[i];
-		GLGLESState::LightLocs &loc = gs->light_locs[i];
-		if (loc.ambient >= 0) glUniform4fv(loc.ambient, 1, L.ambient);
-		if (loc.diffuse >= 0) glUniform4fv(loc.diffuse, 1, L.diffuse);
-		if (loc.specular >= 0) glUniform4fv(loc.specular, 1, L.specular);
-		if (loc.position >= 0) glUniform4fv(loc.position, 1, L.position);
-		if (loc.spot_direction >= 0) glUniform3fv(loc.spot_direction, 1, L.spot_direction);
-		if (loc.spot_exponent >= 0) glUniform1f(loc.spot_exponent, L.spot_exponent);
-		float sc = (L.spot_cutoff >= 180.0f) ? -1.0f : cosf(L.spot_cutoff * (float)M_PI / 180.0f);
-		if (loc.spot_cutoff >= 0) glUniform1f(loc.spot_cutoff, sc);
-		if (loc.constant_atten >= 0) glUniform1f(loc.constant_atten, L.constant_attenuation);
-		if (loc.linear_atten >= 0) glUniform1f(loc.linear_atten, L.linear_attenuation);
-		if (loc.quadratic_atten >= 0) glUniform1f(loc.quadratic_atten, L.quadratic_attenuation);
-		if (loc.enabled >= 0) glUniform1i(loc.enabled, L.enabled ? 1 : 0);
+	if (dirty & GL_UDIRTY_FOG) {
+		glUniform1i(gs->loc_fog_enabled, ctx->fog_enabled ? 1 : 0);
+		glUniform1i(gs->loc_fog_mode, ctx->fog_enabled ? GLFogModeToShader(ctx->fog_mode) : 0);
+		glUniform1f(gs->loc_fog_start, ctx->fog_start);
+		glUniform1f(gs->loc_fog_end, ctx->fog_end);
+		glUniform1f(gs->loc_fog_density, ctx->fog_density);
+		if (ctx->fog_enabled) {
+			glUniform4fv(gs->loc_fog_color, 1, ctx->fog_color);
+		} else {
+			float fc[4] = { 0, 0, 0, -1.0f };
+			glUniform4fv(gs->loc_fog_color, 1, fc);
+		}
 	}
 
-	const GLMaterial &M = ctx->materials[0];
-	glUniform4fv(gs->loc_mat_ambient, 1, M.ambient);
-	glUniform4fv(gs->loc_mat_diffuse, 1, M.diffuse);
-	glUniform4fv(gs->loc_mat_specular, 1, M.specular);
-	glUniform4fv(gs->loc_mat_emission, 1, M.emission);
-	glUniform1f(gs->loc_mat_shininess, M.shininess);
-	glUniform4fv(gs->loc_global_ambient, 1, ctx->light_model_ambient);
+	if (dirty & GL_UDIRTY_MISC) {
+		int texUnit = ctx->active_texture;
+		glUniform1i(gs->loc_lighting_enabled, ctx->lighting_enabled ? 1 : 0);
+		glUniform1i(gs->loc_normalize_enabled, ctx->normalize ? 1 : 0);
+		glUniform1i(gs->loc_texenv_mode, GLTexEnvModeToShader(ctx->tex_units[texUnit].env_mode));
+		glUniform4fv(gs->loc_texenv_color, 1, ctx->tex_units[texUnit].env_color);
+		glUniform1i(gs->loc_alpha_test_enabled, ctx->alpha_test ? 1 : 0);
+		glUniform1i(gs->loc_alpha_func, GLAlphaFuncToShader(ctx->alpha_func));
+		glUniform1f(gs->loc_alpha_ref, ctx->alpha_ref);
+		bool hasTex = ctx->tex_units[texUnit].enabled_2d && ctx->tex_units[texUnit].bound_texture_2d != 0;
+		glUniform1i(gs->loc_has_texture, hasTex ? 1 : 0);
+	}
+
+	if (dirty & GL_UDIRTY_LIGHTING) {
+		for (int i = 0; i < 8; i++) {
+			const GLLight &L = ctx->lights[i];
+			GLGLESState::LightLocs &loc = gs->light_locs[i];
+			if (loc.ambient >= 0) glUniform4fv(loc.ambient, 1, L.ambient);
+			if (loc.diffuse >= 0) glUniform4fv(loc.diffuse, 1, L.diffuse);
+			if (loc.specular >= 0) glUniform4fv(loc.specular, 1, L.specular);
+			if (loc.position >= 0) glUniform4fv(loc.position, 1, L.position);
+			if (loc.spot_direction >= 0) glUniform3fv(loc.spot_direction, 1, L.spot_direction);
+			if (loc.spot_exponent >= 0) glUniform1f(loc.spot_exponent, L.spot_exponent);
+			float sc = (L.spot_cutoff >= 180.0f) ? -1.0f : cosf(L.spot_cutoff * (float)M_PI / 180.0f);
+			if (loc.spot_cutoff >= 0) glUniform1f(loc.spot_cutoff, sc);
+			if (loc.constant_atten >= 0) glUniform1f(loc.constant_atten, L.constant_attenuation);
+			if (loc.linear_atten >= 0) glUniform1f(loc.linear_atten, L.linear_attenuation);
+			if (loc.quadratic_atten >= 0) glUniform1f(loc.quadratic_atten, L.quadratic_attenuation);
+			if (loc.enabled >= 0) glUniform1i(loc.enabled, L.enabled ? 1 : 0);
+		}
+		const GLMaterial &M = ctx->materials[0];
+		glUniform4fv(gs->loc_mat_ambient, 1, M.ambient);
+		glUniform4fv(gs->loc_mat_diffuse, 1, M.diffuse);
+		glUniform4fv(gs->loc_mat_specular, 1, M.specular);
+		glUniform4fv(gs->loc_mat_emission, 1, M.emission);
+		glUniform1f(gs->loc_mat_shininess, M.shininess);
+		glUniform4fv(gs->loc_global_ambient, 1, ctx->light_model_ambient);
+	}
 }
 
 static void ApplyFixedFunctionGLState(GLContext *ctx)
