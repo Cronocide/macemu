@@ -263,11 +263,13 @@ uint32 NQD_copybits(uint32 r3, uint32 r4, uint32 r5, uint32 r6, uint32 r7, uint3
     if (ReadMacInt32(r4 + 0) != screen_base)
         return 1;
 
-    // Source must be an 8-bpp PixMap (rowBytes bit 15 set, pixelSize == 8)
+    // Source must be a PixMap (rowBytes bit 15 set); accept 8/16/32-bpp.
     if (!(ReadMacInt16(r3 + 4) & 0x8000))
         return 1;
-    if (ReadMacInt16(r3 + 32) != 8)
+    const int srcPixelSize = ReadMacInt16(r3 + 32);
+    if (srcPixelSize != 8 && srcPixelSize != 16 && srcPixelSize != 32)
         return 1;
+    const int bpp = srcPixelSize / 8;  // bytes per pixel
 
     // Read source geometry
     uint32 srcBase  = ReadMacInt32(r3 + 0);
@@ -293,8 +295,11 @@ uint32 NQD_copybits(uint32 r3, uint32 r4, uint32 r5, uint32 r6, uint32 r7, uint3
     int    drBot    = (int16)ReadMacInt16(r6 + 4);
     int    drRight  = (int16)ReadMacInt16(r6 + 6);
 
-    // Only handle 1:1 scale
-    if ((srBot - srTop) != (drBot - drTop) || (srRight - srLeft) != (drRight - drLeft))
+    // Detect scaled blit; accept nearest-neighbour if rects are non-zero.
+    const int srH = srBot - srTop, srW = srRight - srLeft;
+    const int drH = drBot - drTop, drW = drRight - drLeft;
+    const bool scaled = (srH != drH || srW != drW);
+    if (scaled && (srH <= 0 || srW <= 0 || drH <= 0 || drW <= 0))
         return 1;
 
     // Clip destination rect to the screen bounds
@@ -306,25 +311,12 @@ uint32 NQD_copybits(uint32 r3, uint32 r4, uint32 r5, uint32 r6, uint32 r7, uint3
     if (clipTop >= clipBottom || clipLeft >= clipRight)
         return 0;  // nothing visible — handled (no-op)
 
-    // Mapping from dst coords to src coords
+    // 1:1 mapping offsets (only used when !scaled)
     int src_dx = srLeft - drLeft;
     int src_dy = srTop  - drTop;
 
     uint8 *src_host = (uint8 *)Mac2HostAddr(srcBase);
     uint8 *dst_host = (uint8 *)Mac2HostAddr(ReadMacInt32(r4 + 0));
-
-    if (r8 == 0) {
-        // No mask region — plain clipped copy
-        int w = clipRight - clipLeft;
-        int dstOff = clipLeft - dstBLeft;
-        int srcOff = clipLeft + src_dx - srcBLeft;
-        for (int y = clipTop; y < clipBottom; y++) {
-            memcpy(dst_host + (y - dstBTop) * dstRB + dstOff,
-                   src_host + (y + src_dy - srcBTop) * srcRB + srcOff,
-                   w);
-        }
-        return 0;
-    }
 
     // Dereference region handle: r8 is a Mac Handle (address of master pointer)
     uint32 rgnPtr  = ReadMacInt32(r8);   // master pointer → Region struct
@@ -343,17 +335,27 @@ uint32 NQD_copybits(uint32 r3, uint32 r4, uint32 r5, uint32 r6, uint32 r7, uint3
     if (clipTop >= clipBottom || clipLeft >= clipRight)
         return 0;
 
-    // Precompute row offsets
-    int dstBaseOff = -dstBLeft;
-    int srcBaseOff = src_dx - srcBLeft;
+    // Precompute row base offsets in bytes (pixel coordinates × bpp).
+    int dstBaseOff = -dstBLeft * bpp;
+    int srcBaseOff = (src_dx - srcBLeft) * bpp;  // unused when scaled
 
     if (rgnSize == 10) {
         // Rectangular region — just clip + copy
-        int w = clipRight - clipLeft;
+        const int w = clipRight - clipLeft;
         for (int y = clipTop; y < clipBottom; y++) {
-            memcpy(dst_host + (y - dstBTop) * dstRB + clipLeft + dstBaseOff,
-                   src_host + (y + src_dy - srcBTop) * srcRB + clipLeft + srcBaseOff,
-                   w);
+            if (!scaled) {
+                memcpy(dst_host + (y - dstBTop) * dstRB + (clipLeft + dstBaseOff / bpp) * bpp,
+                       src_host + (y + src_dy - srcBTop) * srcRB + (clipLeft + srcBaseOff / bpp) * bpp,
+                       w * bpp);
+            } else {
+                int sy = srTop + (y - drTop) * srH / drH;
+                uint8 *drow = dst_host + (y - dstBTop) * dstRB - dstBLeft * bpp;
+                uint8 *srow = src_host + (sy - srcBTop) * srcRB - srcBLeft * bpp;
+                for (int x = clipLeft; x < clipLeft + w; x++) {
+                    int sx = srLeft + (x - drLeft) * srW / drW;
+                    memcpy(drow + x * bpp, srow + sx * bpp, bpp);
+                }
+            }
         }
         return 0;
     }
@@ -405,12 +407,26 @@ uint32 NQD_copybits(uint32 r3, uint32 r4, uint32 r5, uint32 r6, uint32 r7, uint3
 
         for (int y = yStart; y < yEnd; y++) {
             uint8 *drow = dst_host + (y - dstBTop) * dstRB + dstBaseOff;
-            uint8 *srow = src_host + (y + src_dy - srcBTop) * srcRB + srcBaseOff;
+            uint8 *srow;
+            int sy = 0;
+            if (scaled) {
+                sy = srTop + (y - drTop) * srH / drH;
+                srow = src_host + (sy - srcBTop) * srcRB - srcBLeft * bpp;
+            } else {
+                srow = src_host + (y + src_dy - srcBTop) * srcRB + srcBaseOff;
+            }
             for (int s = 0; s + 1 < nActive; s += 2) {
                 int x1 = xbuf[s];     if (x1 < clipLeft)  x1 = clipLeft;
                 int x2 = xbuf[s + 1]; if (x2 > clipRight) x2 = clipRight;
-                if (x1 < x2)
-                    memcpy(drow + x1, srow + x1, x2 - x1);
+                if (x1 >= x2) continue;
+                if (!scaled) {
+                    memcpy(drow + x1 * bpp, srow + x1 * bpp, (x2 - x1) * bpp);
+                } else {
+                    for (int x = x1; x < x2; x++) {
+                        int sx = srLeft + (x - drLeft) * srW / drW;
+                        memcpy(drow + x * bpp, srow + sx * bpp, bpp);
+                    }
+                }
             }
         }
 
