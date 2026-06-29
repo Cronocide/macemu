@@ -754,7 +754,10 @@ void powerpc_cpu::execute(uint32 entry)
 					codegen.execute(bi->entry_point);
 					uint32 post_exec_pc = pc();
 #ifdef SHEEPSHAVER
-					if (ppc_perf_profile) ppc_perf_blocks++;
+					if (ppc_perf_profile) {
+						ppc_perf_blocks++;
+						if ((ppc_perf_blocks & 0xFFFF) == 0) ppc_perf_maybe_report();
+					}
 #endif
 #if PPC_AARCH64_JIT_DEBUG
 					jit_dispatch_ring[jit_dispatch_ring_idx] = { pre_exec_pc, post_exec_pc };
