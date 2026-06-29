@@ -387,6 +387,17 @@ int sheepshaver_cpu::compile1(codegen_context_t & cg_context)
 			dg.gen_store_T0_GPR(3);
 			status = COMPILE_CODE_OK;
 			break;
+		case NATIVE_NQD_BLTMASK_HOOK:
+			dg.gen_load_T0_GPR(3);
+			dg.gen_invoke_T0_ret_T0((uint32 (*)(uint32))NQD_bltmask_hook);
+			dg.gen_store_T0_GPR(3);
+			status = COMPILE_CODE_OK;
+			break;
+		case NATIVE_NQD_BLTMASK:
+			dg.gen_load_T0_GPR(3);
+			dg.gen_invoke_T0((void (*)(uint32))NQD_bltmask);
+			status = COMPILE_CODE_OK;
+			break;
 		case NATIVE_NQD_BITBLT:
 			dg.gen_load_T0_GPR(3);
 			dg.gen_invoke_T0((void (*)(uint32))NQD_bitblt);
@@ -1145,11 +1156,17 @@ void sheepshaver_cpu::execute_native_op(uint32 selector)
 	case NATIVE_NQD_UNKNOWN_HOOK:
 		gpr(3) = NQD_unknown_hook(gpr(3));
 		break;
+	case NATIVE_NQD_BLTMASK_HOOK:
+		gpr(3) = NQD_bltmask_hook(gpr(3));
+		break;
 	case NATIVE_NQD_BITBLT_HOOK:
 		gpr(3) = NQD_bitblt_hook(gpr(3));
 		break;
 	case NATIVE_NQD_BITBLT:
 		NQD_bitblt(gpr(3));
+		break;
+	case NATIVE_NQD_BLTMASK:
+		NQD_bltmask(gpr(3));
 		break;
 	case NATIVE_NQD_FILLRECT_HOOK:
 		gpr(3) = NQD_fillrect_hook(gpr(3));

@@ -71,6 +71,8 @@ enum {
   NATIVE_OPENGL_DISPATCH,
   NATIVE_QD_COPYMASK_PROBE,  // InterfaceLib CopyMask intercept (counting probe)
   NATIVE_QD_COPYBITS,        // InterfaceLib CopyBits fast-path (clips off-screen sprites)
+  NATIVE_NQD_BLTMASK_HOOK,   // NQD ACCL_BLTMASK hook (masked CopyBits)
+  NATIVE_NQD_BLTMASK,        // NQD ACCL_BLTMASK draw proc
   NATIVE_OP_MAX
 };
 

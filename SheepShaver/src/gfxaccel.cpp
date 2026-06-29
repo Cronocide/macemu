@@ -900,6 +900,156 @@ bool NQD_unknown_hook(uint32 arg)
 	return false;
 }
 
+/*
+ *  Masked CopyBits blitter (ACCL_BLTMASK)
+ *
+ *  The parameter block is identical to BITBLT but with a mask region Handle
+ *  at p+0x018 (which is why NQD_bitblt_hook requires that field to be 0).
+ *  We walk the QuickDraw XOR-span region as in NQD_copybits.
+ *
+ *  NOTE: The mask offset 0x018 is determined empirically; when nqd_diag is
+ *  true the hook logs the candidate fields so the offset can be confirmed.
+ */
+
+// Offset (in the accl_params block) where QuickDraw stores the mask
+// region Handle for ACCL_BLTMASK. The bitblt hook rejects calls where
+// this field is non-zero, confirming it is the mask discriminator.
+static const uint32 acclMaskRgnHandle = 0x018;
+
+bool NQD_bltmask_hook(uint32 p)
+{
+	D(bug("accl_bltmask_hook %08x\n", p));
+
+	if (nqd_diag_enabled) nqd_record_hook_entry();
+
+	NQD_set_dirty_area(p);
+
+	// Log candidate mask field values for empirical offset verification.
+	if (nqd_diag_enabled) {
+		printf("[nqd:bltmask] hook p=%08x mask@018=%08x @128=%08x @130=%08x @15c=%08x\n",
+		       p,
+		       ReadMacInt32(p + 0x018), ReadMacInt32(p + 0x128),
+		       ReadMacInt32(p + 0x130), ReadMacInt32(p + 0x15c));
+		fflush(stdout);
+	}
+
+	// Accept if same pixel-format conditions as BITBLT, regardless of mask.
+	if (ReadMacInt32(p + acclSrcPixelSize) >= 8 &&
+		ReadMacInt32(p + acclSrcPixelSize) == ReadMacInt32(p + acclDestPixelSize) &&
+		(int32)(ReadMacInt32(p + acclSrcRowBytes) ^ ReadMacInt32(p + acclDestRowBytes)) >= 0 &&
+		ReadMacInt32(p + acclTransferMode) == 0 &&
+		(int32)ReadMacInt32(p + 0x15c) > 0) {
+
+		WriteMacInt32(p + acclDrawProc, NativeTVECT(NATIVE_NQD_BLTMASK));
+		if (nqd_diag_enabled) { nqd_blit_accel++; nqd_blit_diag_report(); }
+		return true;
+	}
+
+	if (nqd_diag_enabled) { nqd_blit_reject++; nqd_blit_diag_report(); }
+	return false;
+}
+
+void NQD_bltmask(uint32 p)
+{
+	D(bug("accl_bltmask %08x\n", p));
+
+	// Geometry (same as NQD_bitblt).
+	const int16 src_X  = (int16)ReadMacInt16(p + acclSrcRect + 2) - (int16)ReadMacInt16(p + acclSrcBoundsRect + 2);
+	const int16 src_Y  = (int16)ReadMacInt16(p + acclSrcRect + 0) - (int16)ReadMacInt16(p + acclSrcBoundsRect + 0);
+	const int16 dest_X = (int16)ReadMacInt16(p + acclDestRect + 2) - (int16)ReadMacInt16(p + acclDestBoundsRect + 2);
+	const int16 dest_Y = (int16)ReadMacInt16(p + acclDestRect + 0) - (int16)ReadMacInt16(p + acclDestBoundsRect + 0);
+	const int16 width  = (int16)ReadMacInt16(p + acclDestRect + 6) - (int16)ReadMacInt16(p + acclDestRect + 2);
+	const int16 height = (int16)ReadMacInt16(p + acclDestRect + 4) - (int16)ReadMacInt16(p + acclDestRect + 0);
+
+	const int bpp = bytes_per_pixel(ReadMacInt32(p + acclSrcPixelSize));
+	const int width_bytes = width * bpp;
+	if ((int32)ReadMacInt32(p + acclSrcRowBytes) <= 0)
+		return;  // reversed-scanline masked blits not yet handled
+
+	const int src_row_bytes  = (int32)ReadMacInt32(p + acclSrcRowBytes);
+	const int dst_row_bytes  = (int32)ReadMacInt32(p + acclDestRowBytes);
+	uint8 *src = Mac2HostAddr(ReadMacInt32(p + acclSrcBaseAddr) + (src_Y * src_row_bytes) + (src_X * bpp));
+	uint8 *dst = Mac2HostAddr(ReadMacInt32(p + acclDestBaseAddr) + (dest_Y * dst_row_bytes) + (dest_X * bpp));
+
+	// Try to read the mask region from p+acclMaskRgnHandle.
+	// If non-zero it is a Mac Handle (pointer to pointer to region).
+	// If zero (or invalid) fall through to an unmasked plain blit.
+	const uint32 maskHandle = ReadMacInt32(p + acclMaskRgnHandle);
+	if (maskHandle != 0) {
+		const uint32 rgnPtr   = ReadMacInt32(maskHandle);  // dereference handle
+		const int    rgnSize  = (int16)ReadMacInt16(rgnPtr + 0);
+		const int    rgnTop   = (int16)ReadMacInt16(rgnPtr + 2);
+		const int    rgnLeft  = (int16)ReadMacInt16(rgnPtr + 4);
+		const int    rgnBot   = (int16)ReadMacInt16(rgnPtr + 6);
+		const int    rgnRight = (int16)ReadMacInt16(rgnPtr + 8);
+
+		// Clip region bounding box against the destination rect.
+		const int16 destLeft  = (int16)ReadMacInt16(p + acclDestRect + 2);
+		const int16 destTop   = (int16)ReadMacInt16(p + acclDestRect + 0);
+		int clipTop    = rgnTop   > destTop              ? rgnTop   : (int)destTop;
+		int clipLeft   = rgnLeft  > (int)destLeft        ? rgnLeft  : (int)destLeft;
+		int clipBottom = rgnBot   < (int)(destTop+height)? rgnBot   : (int)(destTop+height);
+		int clipRight  = rgnRight < (int)(destLeft+width)? rgnRight : (int)(destLeft+width);
+
+		if (clipTop >= clipBottom || clipLeft >= clipRight)
+			return;
+
+		if (rgnSize == 10) {
+			// Rectangular region: simple clipped copy.
+			const int w = (clipRight - clipLeft) * bpp;
+			for (int y = clipTop; y < clipBottom; y++) {
+				memcpy(dst + (int16)(y - destTop) * dst_row_bytes + (clipLeft - destLeft) * bpp,
+				       src + (int16)(y - destTop) * src_row_bytes + (clipLeft - destLeft) * bpp,
+				       w);
+			}
+			return;
+		}
+
+		// Non-rectangular region: walk XOR-span data (same as NQD_copybits).
+		static uint16 xbuf[64];
+		int nActive = 0;
+		uint32 q = rgnPtr + 10;
+		uint16 curY = ReadMacInt16(q);
+		while (curY != 0x7FFF) {
+			q += 2;
+			uint16 x;
+			while ((x = ReadMacInt16(q)) != 0x7FFF) {
+				q += 2;
+				int i;
+				for (i = 0; i < nActive; i++) {
+					if (xbuf[i] == x) { nActive--; for (int j = i; j < nActive; j++) xbuf[j] = xbuf[j+1]; goto xor_d; }
+					if (xbuf[i] > x) break;
+				}
+				if (nActive < 64) { for (int j = nActive; j > i; j--) xbuf[j] = xbuf[j-1]; xbuf[i] = x; nActive++; }
+				xor_d:;
+			}
+			q += 2;
+			uint16 nextY = ReadMacInt16(q);
+			int yStart = (int)curY  > clipTop    ? (int)curY  : clipTop;
+			int yEnd   = (int)nextY < clipBottom ? (int)nextY : clipBottom;
+			for (int y = yStart; y < yEnd; y++) {
+				uint8 *dr = dst + (y - (int)destTop) * dst_row_bytes - (int)destLeft * bpp;
+				uint8 *sr = src + (y - (int)destTop) * src_row_bytes - (int)destLeft * bpp;
+				for (int s = 0; s+1 < nActive; s += 2) {
+					int x1 = xbuf[s];     if (x1 < clipLeft)  x1 = clipLeft;
+					int x2 = xbuf[s+1];   if (x2 > clipRight) x2 = clipRight;
+					if (x1 < x2)
+						memcpy(dr + x1*bpp, sr + x1*bpp, (x2-x1)*bpp);
+				}
+			}
+			curY = nextY;
+		}
+		return;
+	}
+
+	// No mask (or unrecognised mask format): plain unmasked blit fallback.
+	for (int i = 0; i < height; i++) {
+		memmove(dst, src, width_bytes);
+		src += src_row_bytes;
+		dst += dst_row_bytes;
+	}
+}
+
 // Wait for graphics operation to finish
 bool NQD_sync_hook(uint32 arg)
 {
@@ -933,9 +1083,17 @@ void VideoInstallAccel(void)
 		WriteMacInt32(base + 8, ACCL_FILLRECT);
 		NQDMisc(6, fillrect_hook_info.addr());
 
+		SheepVar bltmask_hook_info(sizeof(accl_hook_info));
+		base = bltmask_hook_info.addr();
+		WriteMacInt32(base + 0, NativeTVECT(NATIVE_NQD_BLTMASK_HOOK));
+		WriteMacInt32(base + 4, NativeTVECT(NATIVE_NQD_SYNC_HOOK));
+		WriteMacInt32(base + 8, ACCL_BLTMASK);
+		NQDMisc(6, bltmask_hook_info.addr());
+
 		for (int op = 0; op < 8; op++) {
 			switch (op) {
 			case ACCL_BITBLT:
+			case ACCL_BLTMASK:
 			case ACCL_FILLRECT:
 				continue;
 			}
