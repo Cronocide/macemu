@@ -287,6 +287,7 @@ struct RaveGLESState {
 
 	GLuint            vao;
 	GLuint            vbo;
+	bool              uv2AttribEnabled;     // tracks VAO attrib-3 enable state across draws
 
 	uint32_t          drawCallCount;
 	uint32_t          triangleCount;
@@ -627,8 +628,19 @@ void RaveInitMetalResources(RaveDrawPrivate *priv)
 	glGenVertexArrays(1, &gs->vao);
 	glGenBuffers(1, &gs->vbo);
 
+	// Bake attrib 0,1,2 (pos, color, uv) as permanently-enabled into the VAO so
+	// we only pay the Enable cost once rather than once per draw call.
+	glBindVertexArray(gs->vao);
+	glBindBuffer(GL_ARRAY_BUFFER, gs->vbo);
+	glEnableVertexAttribArray(0);
+	glEnableVertexAttribArray(1);
+	glEnableVertexAttribArray(2);
+	glBindVertexArray(0);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+
 	gs->renderPassActive = false;
 	gs->currentProgramIdx = -1;
+	gs->uv2AttribEnabled = false;
 
 	RAVE_LOG("GLES resources initialized: %dx%d, fbo=%u, vao=%u, vbo=%u, %d shader variants",
 	         gs->fboWidth, gs->fboHeight, gs->fbo, gs->vao, gs->vbo, RAVE_NUM_SHADER_VARIANTS);
@@ -1096,7 +1108,8 @@ static void SubmitRawVertices(RaveGLESState *gs, const RaveVertex *verts, int co
 		rtex_report();
 	}
 
-	glBindVertexArray(gs->vao);
+	// VAO (gs->vao) is already bound for the render pass with attribs 0,1,2
+	// permanently enabled; just update the buffer and pointer offsets.
 	glBindBuffer(GL_ARRAY_BUFFER, gs->vbo);
 	size_t primaryBytes = (size_t)count * sizeof(RaveVertex);
 	size_t uv2Bytes = (uv2 != NULL) ? ((size_t)count * 4 * sizeof(float)) : 0;
@@ -1105,10 +1118,6 @@ static void SubmitRawVertices(RaveGLESState *gs, const RaveVertex *verts, int co
 	if (uv2Bytes > 0)
 		glBufferSubData(GL_ARRAY_BUFFER, primaryBytes, uv2Bytes, uv2);
 
-	glEnableVertexAttribArray(0);
-	glEnableVertexAttribArray(1);
-	glEnableVertexAttribArray(2);
-
 	glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, sizeof(RaveVertex),
 	                      (void *)offsetof(RaveVertex, pos));
 	glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(RaveVertex),
@@ -1116,21 +1125,19 @@ static void SubmitRawVertices(RaveGLESState *gs, const RaveVertex *verts, int co
 	glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, sizeof(RaveVertex),
 	                      (void *)offsetof(RaveVertex, uv));
 	if (uv2Bytes > 0) {
-		glEnableVertexAttribArray(3);
+		if (!gs->uv2AttribEnabled) {
+			glEnableVertexAttribArray(3);
+			gs->uv2AttribEnabled = true;
+		}
 		glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
 		                      (void *)primaryBytes);
-	} else {
+	} else if (gs->uv2AttribEnabled) {
 		glDisableVertexAttribArray(3);
 		glVertexAttrib4f(3, 0.f, 0.f, 0.f, 0.f);
+		gs->uv2AttribEnabled = false;
 	}
 
 	glDrawArrays(mode, 0, count);
-
-	glDisableVertexAttribArray(3);
-	glDisableVertexAttribArray(2);
-	glDisableVertexAttribArray(1);
-	glDisableVertexAttribArray(0);
-	glBindVertexArray(0);
 
 	gs->drawCallCount++;
 }
@@ -1377,6 +1384,10 @@ int32_t NativeRenderStart(uint32_t drawContextAddr, uint32_t dirtyRectAddr, uint
 	}
 	// #endregion
 
+	// Bind the VAO for the duration of this render pass; attribs 0,1,2 are
+	// permanently enabled in the VAO (set at init time), saving ~3 GL calls/draw.
+	glBindVertexArray(gs->vao);
+
 	gs->renderPassActive = true;
 	gs->currentProgramIdx = -1;
 	gs->drawCallCount = 0;
@@ -1511,6 +1522,14 @@ int32_t NativeRenderEnd(uint32_t drawContextAddr, uint32_t modifiedRectAddr)
 		WriteMacInt32(modifiedRectAddr + 12, (uint32_t)(priv->top + priv->height));
 	}
 
+	// Unbind the render-pass VAO so RestoreGLState's VAO restore lands cleanly.
+	// Leave attrib enable state baked into gs->vao; disable transient attrib 3.
+	if (gs->uv2AttribEnabled) {
+		glDisableVertexAttribArray(3);
+		gs->uv2AttribEnabled = false;
+	}
+	glBindVertexArray(0);
+
 	gs->renderPassActive = false;
 	RestoreGLState(&s_savedGL);
 	gles_gl_unlock();
@@ -1567,6 +1586,11 @@ int32_t NativeRenderAbort(uint32_t drawContextAddr)
 	if (!priv || !priv->metal) return kQAError;
 
 	RaveGLESState *gs = (RaveGLESState *)priv->metal;
+	if (gs->uv2AttribEnabled) {
+		glDisableVertexAttribArray(3);
+		gs->uv2AttribEnabled = false;
+	}
+	glBindVertexArray(0);
 	gs->renderPassActive = false;
 	priv->zsortCount = 0;
 	priv->multiTextureActive = false;
