@@ -289,6 +289,18 @@ struct RaveGLESState {
 	GLuint            vbo;
 	bool              uv2AttribEnabled;     // tracks VAO attrib-3 enable state across draws
 
+	// Cached GL state for dirty-gating redundant ApplyDirtyState calls.
+	// Invalidated at render-pass start (cacheValid=false).
+	bool     cacheValid;
+	int      cacheBlendMode;       // last blend_mode (0/1/2) applied
+	uint32_t cacheColorMask;       // last packed channelMask applied (0xF = default)
+	bool     cacheScissorEnabled;
+	int      cacheScissorX, cacheScissorY, cacheScissorW, cacheScissorH;
+	GLuint   cacheTex0Id;          // last bound GL texture 0
+	GLenum   cacheTex0MinF, cacheTex0MagF, cacheTex0WrapS, cacheTex0WrapT;
+	GLuint   cacheTex1Id;
+	GLenum   cacheTex1MinF, cacheTex1MagF;
+
 	uint32_t          drawCallCount;
 	uint32_t          triangleCount;
 
@@ -765,51 +777,70 @@ static void ApplyDirtyState(RaveDrawPrivate *priv, bool forceAll, bool textured 
 		}
 	}
 
-	// Blend state
-	glEnable(GL_BLEND);
-	glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
-	if (blend_mode == 2) {
-		uint32_t glSrc = priv->state[109].i;
-		uint32_t glDst = priv->state[110].i;
-		glBlendFuncSeparate(GLBlendToGLES(glSrc), GLBlendToGLES(glDst),
-		                   GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-	} else if (blend_mode == 0) {
-		glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA,
-		                   GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-	} else {
-		glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
-		                   GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+	// Blend state — gated on blend_mode change (RAVE always enables blend).
+	if (!gs->cacheValid || blend_mode != gs->cacheBlendMode) {
+		glEnable(GL_BLEND);
+		glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+		if (blend_mode == 2) {
+			uint32_t glSrc = priv->state[109].i;
+			uint32_t glDst = priv->state[110].i;
+			glBlendFuncSeparate(GLBlendToGLES(glSrc), GLBlendToGLES(glDst),
+			                   GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+		} else if (blend_mode == 0) {
+			glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA,
+			                   GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+		} else {
+			glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+			                   GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+		}
+		gs->cacheBlendMode = blend_mode;
 	}
 
 	// Channel write mask (kQATag_ChannelMask, bit0=R bit1=G bit2=B bit3=A).
 	// Treat 0 as default "all channels" to match Metal path behavior.
 	uint32_t channelMask = priv->state[27].i;
 	if (channelMask == 0) channelMask = 0xF;
-	glColorMask((channelMask & 0x1) ? GL_TRUE : GL_FALSE,
-	            (channelMask & 0x2) ? GL_TRUE : GL_FALSE,
-	            (channelMask & 0x4) ? GL_TRUE : GL_FALSE,
-	            (channelMask & 0x8) ? GL_TRUE : GL_FALSE);
+	if (!gs->cacheValid || channelMask != gs->cacheColorMask) {
+		glColorMask((channelMask & 0x1) ? GL_TRUE : GL_FALSE,
+		            (channelMask & 0x2) ? GL_TRUE : GL_FALSE,
+		            (channelMask & 0x4) ? GL_TRUE : GL_FALSE,
+		            (channelMask & 0x8) ? GL_TRUE : GL_FALSE);
+		gs->cacheColorMask = channelMask;
+	}
 
 	// Scissor from GL tags (105-108)
-	if (priv->state[105].i != 0 || priv->state[106].i != 0 ||
-	    priv->state[107].i != 0 || priv->state[108].i != 0) {
-		int sx = (int)priv->state[105].i;
-		int sy = (int)priv->state[106].i;
-		int sw = (int)(priv->state[107].i - priv->state[105].i);
-		int sh = (int)(priv->state[108].i - priv->state[106].i);
-		if (sx < 0) { sw += sx; sx = 0; }
-		if (sy < 0) { sh += sy; sy = 0; }
-		if (sx + sw > priv->width)  sw = priv->width - sx;
-		if (sy + sh > priv->height) sh = priv->height - sy;
-		if (sw > 0 && sh > 0) {
-			glEnable(GL_SCISSOR_TEST);
-			// GLES scissor Y is bottom-up.
-			glScissor(sx, priv->height - sy - sh, sw, sh);
-		} else {
-			glDisable(GL_SCISSOR_TEST);
+	{
+		bool sciEnable = false;
+		int sx = 0, sy_gl = 0, sw = 0, sh = 0;
+		if (priv->state[105].i != 0 || priv->state[106].i != 0 ||
+		    priv->state[107].i != 0 || priv->state[108].i != 0) {
+			sx = (int)priv->state[105].i;
+			int sy = (int)priv->state[106].i;
+			sw = (int)(priv->state[107].i - priv->state[105].i);
+			sh = (int)(priv->state[108].i - priv->state[106].i);
+			if (sx < 0) { sw += sx; sx = 0; }
+			if (sy < 0) { sh += sy; sy = 0; }
+			if (sx + sw > priv->width)  sw = priv->width - sx;
+			if (sy + sh > priv->height) sh = priv->height - sy;
+			if (sw > 0 && sh > 0) {
+				sciEnable = true;
+				sy_gl = priv->height - sy - sh; // GLES scissor Y is bottom-up
+			}
 		}
-	} else {
-		glDisable(GL_SCISSOR_TEST);
+		if (!gs->cacheValid || sciEnable != gs->cacheScissorEnabled) {
+			if (sciEnable) glEnable(GL_SCISSOR_TEST);
+			else           glDisable(GL_SCISSOR_TEST);
+			gs->cacheScissorEnabled = sciEnable;
+			// Invalidate cached coords so the glScissor below fires.
+			gs->cacheScissorX = gs->cacheScissorY = gs->cacheScissorW = gs->cacheScissorH = -1;
+		}
+		if (sciEnable &&
+		    (!gs->cacheValid || sx != gs->cacheScissorX || sy_gl != gs->cacheScissorY ||
+		     sw != gs->cacheScissorW || sh != gs->cacheScissorH)) {
+			glScissor(sx, sy_gl, sw, sh);
+			gs->cacheScissorX = sx; gs->cacheScissorY = sy_gl;
+			gs->cacheScissorW = sw; gs->cacheScissorH = sh;
+		}
 	}
 
 	// Texture binding
@@ -836,9 +867,15 @@ static void ApplyDirtyState(RaveDrawPrivate *priv, bool forceAll, bool textured 
 
 				if (tex_entry->metal_texture) {
 					GLuint texId = (GLuint)(uintptr_t)tex_entry->metal_texture;
-					glBindTexture(GL_TEXTURE_2D, texId);
-					if (sp->loc_texture0 >= 0)
-						glUniform1i(sp->loc_texture0, 0);
+					if (!gs->cacheValid || texId != gs->cacheTex0Id) {
+						glBindTexture(GL_TEXTURE_2D, texId);
+						if (sp->loc_texture0 >= 0)
+							glUniform1i(sp->loc_texture0, 0);
+						gs->cacheTex0Id = texId;
+						// Invalidate sampler cache when texture changes.
+						gs->cacheTex0MinF = gs->cacheTex0MagF = GL_NONE;
+						gs->cacheTex0WrapS = gs->cacheTex0WrapT = GL_NONE;
+					}
 
 					// Honor GL texture tags (101-104) when set; else use kQATag_TextureFilter.
 					uint32_t glWrapU = priv->state[101].i;
@@ -856,10 +893,22 @@ static void ApplyDirtyState(RaveDrawPrivate *priv, bool forceAll, bool textured 
 						minF = (filter >= 1) ? GL_LINEAR : GL_NEAREST;
 						magF = (filter >= 1) ? GL_LINEAR : GL_NEAREST;
 					}
-					glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minF);
-					glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, magF);
-					glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapS);
-					glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrapT);
+					if (minF != gs->cacheTex0MinF) {
+						glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minF);
+						gs->cacheTex0MinF = minF;
+					}
+					if (magF != gs->cacheTex0MagF) {
+						glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, magF);
+						gs->cacheTex0MagF = magF;
+					}
+					if (wrapS != gs->cacheTex0WrapS) {
+						glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapS);
+						gs->cacheTex0WrapS = wrapS;
+					}
+					if (wrapT != gs->cacheTex0WrapT) {
+						glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrapT);
+						gs->cacheTex0WrapT = wrapT;
+					}
 				}
 			}
 		}
@@ -880,14 +929,24 @@ static void ApplyDirtyState(RaveDrawPrivate *priv, bool forceAll, bool textured 
 					RaveRefreshTextureFromPixmap(tex2_entry);
 				if (tex2_entry->metal_texture) {
 					GLuint texId2 = (GLuint)(uintptr_t)tex2_entry->metal_texture;
-					glBindTexture(GL_TEXTURE_2D, texId2);
-					if (sp->loc_texture1 >= 0)
-						glUniform1i(sp->loc_texture1, 1);
+					if (!gs->cacheValid || texId2 != gs->cacheTex1Id) {
+						glBindTexture(GL_TEXTURE_2D, texId2);
+						if (sp->loc_texture1 >= 0)
+							glUniform1i(sp->loc_texture1, 1);
+						gs->cacheTex1Id = texId2;
+						gs->cacheTex1MinF = gs->cacheTex1MagF = GL_NONE;
+					}
 					int filter = (int)priv->state[11].i;
 					GLenum minF = (filter >= 1) ? GL_LINEAR : GL_NEAREST;
 					GLenum magF = (filter >= 1) ? GL_LINEAR : GL_NEAREST;
-					glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minF);
-					glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, magF);
+					if (minF != gs->cacheTex1MinF) {
+						glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minF);
+						gs->cacheTex1MinF = minF;
+					}
+					if (magF != gs->cacheTex1MagF) {
+						glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, magF);
+						gs->cacheTex1MagF = magF;
+					}
 				}
 			}
 			glUniform1i(sp->loc_multi_texture_op, (int)priv->state[35].i);
@@ -936,6 +995,7 @@ static void ApplyDirtyState(RaveDrawPrivate *priv, bool forceAll, bool textured 
 	            priv->state[153].f, priv->state[150].f);
 
 	priv->dirty_flags = 0;
+	gs->cacheValid = true;
 }
 
 
@@ -1390,6 +1450,7 @@ int32_t NativeRenderStart(uint32_t drawContextAddr, uint32_t dirtyRectAddr, uint
 
 	gs->renderPassActive = true;
 	gs->currentProgramIdx = -1;
+	gs->cacheValid = false;   // invalidate GL state cache for this render pass
 	gs->drawCallCount = 0;
 	gs->triangleCount = 0;
 	gs->vtxMinX = 1e30f; gs->vtxMaxX = -1e30f;
