@@ -30,6 +30,42 @@
 #define DEBUG 0
 #include "debug.h"
 
+#ifdef __aarch64__
+#include <arm_neon.h>
+
+static inline void neon_invrect(uint8_t *dest, uint32_t len)
+{
+	for (uint32_t n = len >> 4; n--; dest += 16)
+		vst1q_u8(dest, vmvnq_u8(vld1q_u8(dest)));
+	len &= 15;
+	if (len & 8) { uint64_t *p = (uint64_t *)dest; *p = ~*p; dest += 8; }
+	if (len & 4) { uint32_t *p = (uint32_t *)dest; *p = ~*p; dest += 4; }
+	if (len & 2) { uint16_t *p = (uint16_t *)dest; *p = ~*p; dest += 2; }
+	if (len & 1) { *dest = ~*dest; }
+}
+
+static inline void neon_fillrect_u16(uint8_t *dest, uint16_t val, uint32_t len)
+{
+	const uint8x16_t v = vreinterpretq_u8_u16(vdupq_n_u16(val));
+	for (uint32_t n = len >> 4; n--; dest += 16)
+		vst1q_u8(dest, v);
+	len &= 15;
+	if (len & 8) { vst1_u8(dest, vreinterpret_u8_u16(vdup_n_u16(val))); dest += 8; }
+	if (len & 4) { *(uint32_t *)dest = (uint32_t)val | ((uint32_t)val << 16); dest += 4; }
+	if (len & 2) { *(uint16_t *)dest = val; }
+}
+
+static inline void neon_fillrect_u32(uint8_t *dest, uint32_t val, uint32_t len)
+{
+	const uint8x16_t v = vreinterpretq_u8_u32(vdupq_n_u32(val));
+	for (uint32_t n = len >> 4; n--; dest += 16)
+		vst1q_u8(dest, v);
+	len &= 15;
+	if (len & 8) { vst1_u8(dest, vreinterpret_u8_u32(vdup_n_u32(val))); dest += 8; }
+	if (len & 4) { *(uint32_t *)dest = val; }
+}
+#endif  // __aarch64__
+
 // 3D acceleration hooks (RAVE engine + OpenGL CFM library).  Forward-declared
 // here to avoid pulling gfxaccel/include/rave_engine.h or gl_engine.h into
 // this translation unit (which would also drag in their private state structs).
@@ -477,6 +513,10 @@ static inline void NQD_set_dirty_area(uint32 p)
 template< int bpp >
 static inline void do_invrect(uint8 *dest, uint32 length)
 {
+#ifdef __aarch64__
+	neon_invrect(dest, length);
+	return;
+#endif
 #define INVERT_1(PTR, OFS) ((uint8  *)(PTR))[OFS] = ~((uint8  *)(PTR))[OFS]
 #define INVERT_2(PTR, OFS) ((uint16 *)(PTR))[OFS] = ~((uint16 *)(PTR))[OFS]
 #define INVERT_4(PTR, OFS) ((uint32 *)(PTR))[OFS] = ~((uint32 *)(PTR))[OFS]
@@ -590,6 +630,15 @@ void NQD_invrect(uint32 p)
 template< int bpp >
 static inline void do_fillrect(uint8 *dest, uint32 color, uint32 length)
 {
+#ifdef __aarch64__
+	if (bpp == 16)
+		neon_fillrect_u16(dest, (uint16_t)color, length);
+	else if (bpp == 32)
+		neon_fillrect_u32(dest, color, length);
+	else
+		memset(dest, (uint8_t)color, length);
+	return;
+#endif
 #define FILL_1(PTR, OFS, VAL) ((uint8  *)(PTR))[OFS] = (VAL)
 #define FILL_2(PTR, OFS, VAL) ((uint16 *)(PTR))[OFS] = (VAL)
 #define FILL_4(PTR, OFS, VAL) ((uint32 *)(PTR))[OFS] = (VAL)
