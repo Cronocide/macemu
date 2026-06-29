@@ -64,7 +64,62 @@ static inline void neon_fillrect_u32(uint8_t *dest, uint32_t val, uint32_t len)
 	if (len & 8) { vst1_u8(dest, vreinterpret_u8_u32(vdup_n_u32(val))); dest += 8; }
 	if (len & 4) { *(uint32_t *)dest = val; }
 }
+
+// Bitwise row-combine for srcOr/srcXor/srcBic (modes 1/2/3).
+// mode: 1=OR, 2=XOR, 3=BIC (dst &= ~src).
+static inline void neon_rowop(uint8_t *dst, const uint8_t *src, uint32_t len, int mode)
+{
+	uint32_t n = len >> 4;
+	if (mode == 1) {
+		for (; n--; dst += 16, src += 16)
+			vst1q_u8(dst, vorrq_u8(vld1q_u8(dst), vld1q_u8(src)));
+	} else if (mode == 2) {
+		for (; n--; dst += 16, src += 16)
+			vst1q_u8(dst, veorq_u8(vld1q_u8(dst), vld1q_u8(src)));
+	} else {  // mode == 3: BIC
+		for (; n--; dst += 16, src += 16)
+			vst1q_u8(dst, vbicq_u8(vld1q_u8(dst), vld1q_u8(src)));
+	}
+	// scalar tail
+	len &= 15;
+	if (len & 8) {
+		uint64_t sv = *(const uint64_t *)src, dv = *(uint64_t *)dst;
+		*(uint64_t *)dst = (mode == 1) ? (dv | sv) : (mode == 2) ? (dv ^ sv) : (dv & ~sv);
+		dst += 8; src += 8;
+	}
+	if (len & 4) {
+		uint32_t sv = *(const uint32_t *)src, dv = *(uint32_t *)dst;
+		*(uint32_t *)dst = (mode == 1) ? (dv | sv) : (mode == 2) ? (dv ^ sv) : (dv & ~sv);
+		dst += 4; src += 4;
+	}
+	if (len & 2) {
+		uint16_t sv = *(const uint16_t *)src, dv = *(uint16_t *)dst;
+		*(uint16_t *)dst = (mode == 1) ? (dv | sv) : (mode == 2) ? (dv ^ sv) : (dv & ~sv);
+		dst += 2; src += 2;
+	}
+	if (len & 1) {
+		uint8_t sv = *src, dv = *dst;
+		*dst = (mode == 1) ? (dv | sv) : (mode == 2) ? (dv ^ sv) : (dv & ~sv);
+	}
+}
 #endif  // __aarch64__
+
+// Scalar fallback for bitwise row-combine (non-AArch64 or mode dispatch).
+static inline void scalar_rowop(uint8_t *dst, const uint8_t *src, uint32_t len, int mode)
+{
+	if (mode == 1) { for (uint32_t i = 0; i < len; i++) dst[i] |= src[i]; }
+	else if (mode == 2) { for (uint32_t i = 0; i < len; i++) dst[i] ^= src[i]; }
+	else { for (uint32_t i = 0; i < len; i++) dst[i] &= ~src[i]; }
+}
+
+static inline void do_rowop(uint8_t *dst, const uint8_t *src, int len, int mode)
+{
+#ifdef __aarch64__
+	neon_rowop(dst, src, (uint32_t)len, mode);
+#else
+	scalar_rowop(dst, src, (uint32_t)len, mode);
+#endif
+}
 
 // 3D acceleration hooks (RAVE engine + OpenGL CFM library).  Forward-declared
 // here to avoid pulling gfxaccel/include/rave_engine.h or gl_engine.h into
@@ -811,6 +866,7 @@ void NQD_bitblt(uint32 p)
 
 	// And perform the blit
 	const int bpp = bytes_per_pixel(ReadMacInt32(p + acclSrcPixelSize));
+	const int mode = (int)ReadMacInt32(p + acclTransferMode);  // 0=copy 1=or 2=xor 3=bic
 	width *= bpp;
 	if ((int32)ReadMacInt32(p + acclSrcRowBytes) > 0) {
 		const int src_row_bytes = (int32)ReadMacInt32(p + acclSrcRowBytes);
@@ -818,7 +874,8 @@ void NQD_bitblt(uint32 p)
 		uint8 *src = Mac2HostAddr(ReadMacInt32(p + acclSrcBaseAddr) + (src_Y * src_row_bytes) + (src_X * bpp));
 		uint8 *dst = Mac2HostAddr(ReadMacInt32(p + acclDestBaseAddr) + (dest_Y * dst_row_bytes) + (dest_X * bpp));
 		for (int i = 0; i < height; i++) {
-			memmove(dst, src, width);
+			if (mode == 0) memmove(dst, src, width);
+			else           do_rowop(dst, src, width, mode);
 			src += src_row_bytes;
 			dst += dst_row_bytes;
 		}
@@ -829,7 +886,8 @@ void NQD_bitblt(uint32 p)
 		uint8 *src = Mac2HostAddr(ReadMacInt32(p + acclSrcBaseAddr) + ((src_Y + height - 1) * src_row_bytes) + (src_X * bpp));
 		uint8 *dst = Mac2HostAddr(ReadMacInt32(p + acclDestBaseAddr) + ((dest_Y + height - 1) * dst_row_bytes) + (dest_X * bpp));
 		for (int i = height - 1; i >= 0; i--) {
-			memmove(dst, src, width);
+			if (mode == 0) memmove(dst, src, width);
+			else           do_rowop(dst, src, width, mode);
 			src -= src_row_bytes;
 			dst -= dst_row_bytes;
 		}
@@ -873,7 +931,7 @@ bool NQD_bitblt_hook(uint32 p)
 		ReadMacInt32(p + acclSrcPixelSize) >= 8 &&
 		ReadMacInt32(p + acclSrcPixelSize) == ReadMacInt32(p + acclDestPixelSize) &&
 		(int32)(ReadMacInt32(p + acclSrcRowBytes) ^ ReadMacInt32(p + acclDestRowBytes)) >= 0 &&	// same sign?
-		ReadMacInt32(p + acclTransferMode) == 0 &&												// srcCopy?
+		ReadMacInt32(p + acclTransferMode) <= 3 &&												// srcCopy/Or/Xor/Bic?
 		(int32)ReadMacInt32(p + 0x15c) > 0) {
 
 		// Yes, set function pointer
