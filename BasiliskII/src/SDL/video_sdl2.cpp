@@ -1122,15 +1122,14 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 
 	SDL_RenderSetIntegerScale(sdl_renderer, PrefsFindBool("scale_integer") ? SDL_TRUE : SDL_FALSE);
 
-	// Optionally enable the GPU present path for the depths where it removes
-	// real CPU conversion cost (8-bit palette expansion, 16-bit blit).  32-bit
-	// already wraps the_buffer directly with no conversion, so it stays on the
-	// SDL path.  Falls back silently to the SDL path if init fails.
+	// Optionally enable the GPU present path for depths where it removes
+	// CPU conversion cost.  Falls back silently to the SDL path if init fails.
 	gpu_present_active = false;
 	if (gpu_present_pref) {
 		int bits = 0;
 		if (depth == VIDEO_DEPTH_8BIT) bits = 8;
 		else if (depth == VIDEO_DEPTH_16BIT) bits = 16;
+		else if (depth == VIDEO_DEPTH_32BIT) bits = 32;
 		if (bits && gles_present_supported(bits)) {
 			const int intscale = PrefsFindBool("scale_integer") ? 1 : 0;
 			gles_gl_lock();

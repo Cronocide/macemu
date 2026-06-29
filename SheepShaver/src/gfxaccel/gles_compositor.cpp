@@ -427,8 +427,10 @@ void gles_compositor_composite_overlays(int out_w, int out_h)
 
 static GLuint s_presentProg8  = 0;	// 8-bit indexed -> palette lookup
 static GLuint s_presentProg16 = 0;	// 16-bit RGB565 passthrough
+static GLuint s_presentProg32 = 0;	// 32-bit ARGB (Mac big-endian) passthrough
 static GLint  s_presentLocFb8  = -1, s_presentLocPal8 = -1;
 static GLint  s_presentLocFb16 = -1;
+static GLint  s_presentLocFb32 = -1;
 static GLuint s_fbTex  = 0;			// framebuffer texture
 static GLuint s_palTex = 0;			// 256x1 palette texture (8-bit only)
 static int    s_presentDepth = 0;	// bits
@@ -469,6 +471,20 @@ static const char *s_present16FS =
     "  fragColor = vec4(R / 31.0, G / 31.0, B / 31.0, 1.0);\n"
     "}\n";
 
+// Mac 32-bit is ARGB big-endian: bytes at pixel addr are [A, R, G, B].
+// Uploaded as GL_RGBA/GL_UNSIGNED_BYTE so the sampler receives
+//   .r = A (always 0x00), .g = R_mac, .b = G_mac, .a = B_mac.
+// Swizzle .gba to recover [R, G, B] and force alpha=1.
+static const char *s_present32FS =
+    "precision mediump float;\n"
+    "in vec2 v_uv;\n"
+    "uniform sampler2D u_fb;\n"
+    "out vec4 fragColor;\n"
+    "void main() {\n"
+    "  vec4 px = texture(u_fb, v_uv);\n"
+    "  fragColor = vec4(px.g, px.b, px.a, 1.0);\n"
+    "}\n";
+
 static GLuint BuildPresentProgram(const char *fsSrc)
 {
     GLuint vs = CompileShader(GL_VERTEX_SHADER, s_blitVS);
@@ -499,7 +515,8 @@ int gles_present_supported(int depth_bits)
 {
     // 8-bit  -> indexed, decoded via a 256-entry palette LUT.
     // 16-bit -> byte-swapped RGB555, decoded from raw bytes (see s_present16FS).
-    return (depth_bits == 8 || depth_bits == 16) ? 1 : 0;
+    // 32-bit -> ARGB big-endian, swizzled to RGB in shader (see s_present32FS).
+    return (depth_bits == 8 || depth_bits == 16 || depth_bits == 32) ? 1 : 0;
 }
 
 int gles_present_init(int depth_bits, int width, int height, int integer_scale)
@@ -538,13 +555,21 @@ int gles_present_init(int depth_bits, int width, int height, int integer_scale)
                          GL_RGBA, GL_UNSIGNED_BYTE, NULL);
         }
         s_palDirty = true;
-    } else { // 16-bit (byte-swapped RGB555, decoded in shader from raw bytes)
+    } else if (depth_bits == 16) {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, width, height, 0,
                      GL_RG, GL_UNSIGNED_BYTE, NULL);
         if (!s_presentProg16) {
             s_presentProg16 = BuildPresentProgram(s_present16FS);
             if (!s_presentProg16) return -1;
             s_presentLocFb16 = glGetUniformLocation(s_presentProg16, "u_fb");
+        }
+    } else { // 32-bit: Mac ARGB big-endian, bytes [A, R, G, B], swizzled in shader
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        if (!s_presentProg32) {
+            s_presentProg32 = BuildPresentProgram(s_present32FS);
+            if (!s_presentProg32) return -1;
+            s_presentLocFb32 = glGetUniformLocation(s_presentProg32, "u_fb");
         }
     }
     COMPOSITOR_LOG("gles_present_init: depth=%d %dx%d intscale=%d fbTex=%u",
@@ -563,7 +588,7 @@ void gles_present_upload(const void *pixels, int pitch_bytes,
                          int x, int y, int w, int h)
 {
     if (!s_fbTex || !pixels || w <= 0 || h <= 0) return;
-    const int bpp = (s_presentDepth == 8) ? 1 : 2;
+    const int bpp = (s_presentDepth == 8) ? 1 : (s_presentDepth == 16) ? 2 : 4;
     const uint8_t *base = (const uint8_t *)pixels + (size_t)y * pitch_bytes + (size_t)x * bpp;
 
     glBindTexture(GL_TEXTURE_2D, s_fbTex);
@@ -571,15 +596,19 @@ void gles_present_upload(const void *pixels, int pitch_bytes,
     glPixelStorei(GL_UNPACK_ROW_LENGTH, pitch_bytes / bpp);
     if (s_presentDepth == 8)
         glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RED, GL_UNSIGNED_BYTE, base);
-    else
+    else if (s_presentDepth == 16)
         glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RG, GL_UNSIGNED_BYTE, base);
+    else  // 32-bit: raw ARGB bytes, shader swizzles to RGB
+        glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, base);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 }
 
 void gles_present_draw(int out_w, int out_h, int clear)
 {
     if (!s_fbTex || s_presentW <= 0 || s_presentH <= 0) return;
-    const GLuint prog = (s_presentDepth == 8) ? s_presentProg8 : s_presentProg16;
+    const GLuint prog = (s_presentDepth == 8) ? s_presentProg8
+                      : (s_presentDepth == 16) ? s_presentProg16
+                      : s_presentProg32;
     if (!prog) return;
 
     SavedState saved;
@@ -644,8 +673,10 @@ void gles_present_draw(int out_w, int out_h, int clear)
             s_palDirty = false;
         }
         glUniform1i(s_presentLocPal8, 1);
-    } else {
+    } else if (s_presentDepth == 16) {
         glUniform1i(s_presentLocFb16, 0);
+    } else {  // 32-bit
+        glUniform1i(s_presentLocFb32, 0);
     }
 
     glBindBuffer(GL_ARRAY_BUFFER, s_blitVBO);
