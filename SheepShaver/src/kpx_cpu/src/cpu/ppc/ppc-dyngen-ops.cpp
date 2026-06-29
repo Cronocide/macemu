@@ -1879,4 +1879,159 @@ void op_neon_vsel(void)
 				  : "v0", "v1", "v2", "memory");
 }
 
+/* ---- A1: vperm via tbl ------------------------------------------------- */
+
+void op_neon_vperm(void)
+{
+	/* Index transform: stored vC byte at pos j holds PPC index n for result
+	 * stored pos j. TBL stored-space index = (n & 0x1f) ^ 3, which XORs the
+	 * bottom 2 bits (within-word endian swap) while preserving bit 4 (vA/vB
+	 * select).  Table = {stored vA (entries 0-15), stored vB (entries 16-31)}. */
+	asm volatile (
+		"ldr q0, [%1]\n"
+		"ldr q1, [%2]\n"
+		"ldr q2, [%3]\n"
+		"movi v3.16b, #31\n"
+		"and  v2.16b, v2.16b, v3.16b\n"
+		"movi v3.16b, #3\n"
+		"eor  v2.16b, v2.16b, v3.16b\n"
+		"tbl  v0.16b, {v0.16b, v1.16b}, v2.16b\n"
+		"str  q0, [%0]\n"
+		: : "r" (reg_VD), "r" (reg_V0), "r" (reg_V1), "r" (reg_V2)
+		: "v0", "v1", "v2", "v3", "memory");
+}
+
+/* ---- A2: vspltb via dup (NEON lane = UIMM ^ 3) ------------------------ */
+
+#define VSPLTB_OP(U, L) \
+void op_neon_vspltb_##U(void) { \
+	asm volatile ("ldr q0, [%1]\n" \
+	              "dup v0.16b, v0.b[" #L "]\n" \
+	              "str q0, [%0]\n" \
+	              : : "r" (reg_VD), "r" (reg_V1) : "v0", "memory"); \
+}
+VSPLTB_OP( 0, 3) VSPLTB_OP( 1, 2) VSPLTB_OP( 2, 1) VSPLTB_OP( 3, 0)
+VSPLTB_OP( 4, 7) VSPLTB_OP( 5, 6) VSPLTB_OP( 6, 5) VSPLTB_OP( 7, 4)
+VSPLTB_OP( 8,11) VSPLTB_OP( 9,10) VSPLTB_OP(10, 9) VSPLTB_OP(11, 8)
+VSPLTB_OP(12,15) VSPLTB_OP(13,14) VSPLTB_OP(14,13) VSPLTB_OP(15,12)
+#undef VSPLTB_OP
+
+/* ---- A2: vsplth via dup (NEON lane = UIMM ^ 1) ------------------------ */
+
+#define VSPLTH_OP(U, L) \
+void op_neon_vsplth_##U(void) { \
+	asm volatile ("ldr q0, [%1]\n" \
+	              "dup v0.8h, v0.h[" #L "]\n" \
+	              "str q0, [%0]\n" \
+	              : : "r" (reg_VD), "r" (reg_V1) : "v0", "memory"); \
+}
+VSPLTH_OP(0,1) VSPLTH_OP(1,0) VSPLTH_OP(2,3) VSPLTH_OP(3,2)
+VSPLTH_OP(4,5) VSPLTH_OP(5,4) VSPLTH_OP(6,7) VSPLTH_OP(7,6)
+#undef VSPLTH_OP
+
+/* ---- A2: vspltw via dup (NEON lane = UIMM, no element remap for words) */
+
+#define VSPLTW_OP(U) \
+void op_neon_vspltw_##U(void) { \
+	asm volatile ("ldr q0, [%1]\n" \
+	              "dup v0.4s, v0.s[" #U "]\n" \
+	              "str q0, [%0]\n" \
+	              : : "r" (reg_VD), "r" (reg_V1) : "v0", "memory"); \
+}
+VSPLTW_OP(0) VSPLTW_OP(1) VSPLTW_OP(2) VSPLTW_OP(3)
+#undef VSPLTW_OP
+
+/* ---- A3: vsldoi via rev32+ext+rev32 ----------------------------------- */
+/* rev32 converts stored<->big-endian by reversing bytes within each 4-byte
+ * word; ext then extracts SH bytes from the big-endian concatenation, and
+ * the second rev32 converts the result back to stored format. */
+
+#define VSLDOI_OP(S) \
+void op_neon_vsldoi_##S(void) { \
+	asm volatile ("ldr  q0, [%1]\n" \
+	              "ldr  q1, [%2]\n" \
+	              "rev32 v0.16b, v0.16b\n" \
+	              "rev32 v1.16b, v1.16b\n" \
+	              "ext  v0.16b, v0.16b, v1.16b, #" #S "\n" \
+	              "rev32 v0.16b, v0.16b\n" \
+	              "str  q0, [%0]\n" \
+	              : : "r" (reg_VD), "r" (reg_V0), "r" (reg_V1) \
+	              : "v0", "v1", "memory"); \
+}
+VSLDOI_OP( 0) VSLDOI_OP( 1) VSLDOI_OP( 2) VSLDOI_OP( 3)
+VSLDOI_OP( 4) VSLDOI_OP( 5) VSLDOI_OP( 6) VSLDOI_OP( 7)
+VSLDOI_OP( 8) VSLDOI_OP( 9) VSLDOI_OP(10) VSLDOI_OP(11)
+VSLDOI_OP(12) VSLDOI_OP(13) VSLDOI_OP(14) VSLDOI_OP(15)
+#undef VSLDOI_OP
+
+/* ---- A4: vspltisb — movi all 16 bytes with (uint8)(int8)SIMM ---------- */
+
+#define VSPLTISB_OP(SFX, IMM) \
+void op_neon_vspltisb_##SFX(void) { \
+	asm volatile ("movi v0.16b, #" #IMM "\n" \
+	              "str  q0, [%0]\n" \
+	              : : "r" (reg_VD) : "v0", "memory"); \
+}
+VSPLTISB_OP(n16,240) VSPLTISB_OP(n15,241) VSPLTISB_OP(n14,242) VSPLTISB_OP(n13,243)
+VSPLTISB_OP(n12,244) VSPLTISB_OP(n11,245) VSPLTISB_OP(n10,246) VSPLTISB_OP(n9, 247)
+VSPLTISB_OP(n8, 248) VSPLTISB_OP(n7, 249) VSPLTISB_OP(n6, 250) VSPLTISB_OP(n5, 251)
+VSPLTISB_OP(n4, 252) VSPLTISB_OP(n3, 253) VSPLTISB_OP(n2, 254) VSPLTISB_OP(n1, 255)
+VSPLTISB_OP(p0,   0) VSPLTISB_OP(p1,   1) VSPLTISB_OP(p2,   2) VSPLTISB_OP(p3,   3)
+VSPLTISB_OP(p4,   4) VSPLTISB_OP(p5,   5) VSPLTISB_OP(p6,   6) VSPLTISB_OP(p7,   7)
+VSPLTISB_OP(p8,   8) VSPLTISB_OP(p9,   9) VSPLTISB_OP(p10, 10) VSPLTISB_OP(p11, 11)
+VSPLTISB_OP(p12, 12) VSPLTISB_OP(p13, 13) VSPLTISB_OP(p14, 14) VSPLTISB_OP(p15, 15)
+#undef VSPLTISB_OP
+
+/* ---- A4: vspltish — movi (SIMM>=0) or mvni (SIMM<0) all 8 halfwords -- */
+/* mvni v0.8h, #N means each halfword = ~N = ~(N & 0xff).
+ * For SIMM in -16..-1: value = (int16)SIMM, N = ~value & 0xff = -SIMM-1. */
+
+#define VSPLTISH_MOVI(SFX, IMM) \
+void op_neon_vspltish_##SFX(void) { \
+	asm volatile ("movi v0.8h, #" #IMM "\n" \
+	              "str  q0, [%0]\n" \
+	              : : "r" (reg_VD) : "v0", "memory"); \
+}
+#define VSPLTISH_MVNI(SFX, IMM) \
+void op_neon_vspltish_##SFX(void) { \
+	asm volatile ("mvni v0.8h, #" #IMM "\n" \
+	              "str  q0, [%0]\n" \
+	              : : "r" (reg_VD) : "v0", "memory"); \
+}
+VSPLTISH_MVNI(n16,15) VSPLTISH_MVNI(n15,14) VSPLTISH_MVNI(n14,13) VSPLTISH_MVNI(n13,12)
+VSPLTISH_MVNI(n12,11) VSPLTISH_MVNI(n11,10) VSPLTISH_MVNI(n10, 9) VSPLTISH_MVNI(n9,  8)
+VSPLTISH_MVNI(n8,  7) VSPLTISH_MVNI(n7,  6) VSPLTISH_MVNI(n6,  5) VSPLTISH_MVNI(n5,  4)
+VSPLTISH_MVNI(n4,  3) VSPLTISH_MVNI(n3,  2) VSPLTISH_MVNI(n2,  1) VSPLTISH_MVNI(n1,  0)
+VSPLTISH_MOVI(p0,  0) VSPLTISH_MOVI(p1,  1) VSPLTISH_MOVI(p2,  2) VSPLTISH_MOVI(p3,  3)
+VSPLTISH_MOVI(p4,  4) VSPLTISH_MOVI(p5,  5) VSPLTISH_MOVI(p6,  6) VSPLTISH_MOVI(p7,  7)
+VSPLTISH_MOVI(p8,  8) VSPLTISH_MOVI(p9,  9) VSPLTISH_MOVI(p10,10) VSPLTISH_MOVI(p11,11)
+VSPLTISH_MOVI(p12,12) VSPLTISH_MOVI(p13,13) VSPLTISH_MOVI(p14,14) VSPLTISH_MOVI(p15,15)
+#undef VSPLTISH_MOVI
+#undef VSPLTISH_MVNI
+
+/* ---- A4: vspltisw — movi (SIMM>=0) or mvni (SIMM<0) all 4 words ------- */
+
+#define VSPLTISW_MOVI(SFX, IMM) \
+void op_neon_vspltisw_##SFX(void) { \
+	asm volatile ("movi v0.4s, #" #IMM "\n" \
+	              "str  q0, [%0]\n" \
+	              : : "r" (reg_VD) : "v0", "memory"); \
+}
+#define VSPLTISW_MVNI(SFX, IMM) \
+void op_neon_vspltisw_##SFX(void) { \
+	asm volatile ("mvni v0.4s, #" #IMM "\n" \
+	              "str  q0, [%0]\n" \
+	              : : "r" (reg_VD) : "v0", "memory"); \
+}
+VSPLTISW_MVNI(n16,15) VSPLTISW_MVNI(n15,14) VSPLTISW_MVNI(n14,13) VSPLTISW_MVNI(n13,12)
+VSPLTISW_MVNI(n12,11) VSPLTISW_MVNI(n11,10) VSPLTISW_MVNI(n10, 9) VSPLTISW_MVNI(n9,  8)
+VSPLTISW_MVNI(n8,  7) VSPLTISW_MVNI(n7,  6) VSPLTISW_MVNI(n6,  5) VSPLTISW_MVNI(n5,  4)
+VSPLTISW_MVNI(n4,  3) VSPLTISW_MVNI(n3,  2) VSPLTISW_MVNI(n2,  1) VSPLTISW_MVNI(n1,  0)
+VSPLTISW_MOVI(p0,  0) VSPLTISW_MOVI(p1,  1) VSPLTISW_MOVI(p2,  2) VSPLTISW_MOVI(p3,  3)
+VSPLTISW_MOVI(p4,  4) VSPLTISW_MOVI(p5,  5) VSPLTISW_MOVI(p6,  6) VSPLTISW_MOVI(p7,  7)
+VSPLTISW_MOVI(p8,  8) VSPLTISW_MOVI(p9,  9) VSPLTISW_MOVI(p10,10) VSPLTISW_MOVI(p11,11)
+VSPLTISW_MOVI(p12,12) VSPLTISW_MOVI(p13,13) VSPLTISW_MOVI(p14,14) VSPLTISW_MOVI(p15,15)
+#undef VSPLTISW_MOVI
+#undef VSPLTISW_MVNI
+
 #endif /* __aarch64__ */

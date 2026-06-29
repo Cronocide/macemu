@@ -51,96 +51,6 @@ static inline int unpack_vr_index(uint32 packed, int shift)
 	return (packed >> shift) & 31;
 }
 
-static void call_aarch64_vperm(dyngen_cpu_base cpu_base, uint32 packed)
-{
-	powerpc_cpu *cpu = (powerpc_cpu *)cpu_base;
-	const powerpc_vr &vA = cpu->vr(unpack_vr_index(packed, 5));
-	const powerpc_vr &vB = cpu->vr(unpack_vr_index(packed, 10));
-	const powerpc_vr &vC = cpu->vr(unpack_vr_index(packed, 15));
-	powerpc_vr &vD = cpu->vr(unpack_vr_index(packed, 0));
-	for (int i = 0; i < 16; i++) {
-		const int ei = ev_mixed::byte_element(i);
-		const int n = vC.b[ei] & 0x1f;
-		const int en = ev_mixed::byte_element(n & 0x0f);
-		vD.b[ei] = (n & 0x10) ? vB.b[en] : vA.b[en];
-	}
-}
-
-static void call_aarch64_vsldoi(dyngen_cpu_base cpu_base, uint32 packed)
-{
-	powerpc_cpu *cpu = (powerpc_cpu *)cpu_base;
-	const powerpc_vr &vA = cpu->vr(unpack_vr_index(packed, 5));
-	const powerpc_vr &vB = cpu->vr(unpack_vr_index(packed, 10));
-	powerpc_vr &vD = cpu->vr(unpack_vr_index(packed, 0));
-	const int sh = (packed >> 15) & 0x0f;
-	for (int i = 0; i < 16; i++) {
-		const int ei = ev_mixed::byte_element(i);
-		if (i + sh < 16)
-			vD.b[ei] = vA.b[ev_mixed::byte_element(i + sh)];
-		else
-			vD.b[ei] = vB.b[ev_mixed::byte_element(i - (16 - sh))];
-	}
-}
-
-static void call_aarch64_vspltb(dyngen_cpu_base cpu_base, uint32 packed)
-{
-	powerpc_cpu *cpu = (powerpc_cpu *)cpu_base;
-	powerpc_vr &vD = cpu->vr(unpack_vr_index(packed, 0));
-	const powerpc_vr &vB = cpu->vr(unpack_vr_index(packed, 10));
-	const int n = (packed >> 5) & 0x0f;
-	const uint8 value = vB.b[ev_mixed::byte_element(n)];
-	for (int i = 0; i < 16; i++)
-		vD.b[i] = value;
-}
-
-static void call_aarch64_vsplth(dyngen_cpu_base cpu_base, uint32 packed)
-{
-	powerpc_cpu *cpu = (powerpc_cpu *)cpu_base;
-	powerpc_vr &vD = cpu->vr(unpack_vr_index(packed, 0));
-	const powerpc_vr &vB = cpu->vr(unpack_vr_index(packed, 10));
-	const int n = (packed >> 5) & 0x07;
-	const uint16 value = vB.h[ev_mixed::half_element(n)];
-	for (int i = 0; i < 8; i++)
-		vD.h[i] = value;
-}
-
-static void call_aarch64_vspltw(dyngen_cpu_base cpu_base, uint32 packed)
-{
-	powerpc_cpu *cpu = (powerpc_cpu *)cpu_base;
-	powerpc_vr &vD = cpu->vr(unpack_vr_index(packed, 0));
-	const powerpc_vr &vB = cpu->vr(unpack_vr_index(packed, 10));
-	const int n = (packed >> 5) & 0x03;
-	const uint32 value = vB.w[n];
-	for (int i = 0; i < 4; i++)
-		vD.w[i] = value;
-}
-
-static void call_aarch64_vspltisb(dyngen_cpu_base cpu_base, uint32 packed)
-{
-	powerpc_cpu *cpu = (powerpc_cpu *)cpu_base;
-	powerpc_vr &vD = cpu->vr(unpack_vr_index(packed, 0));
-	const int8 value = (int8)((packed >> 8) & 0xff);
-	for (int i = 0; i < 16; i++)
-		vD.b[i] = (uint8)value;
-}
-
-static void call_aarch64_vspltish(dyngen_cpu_base cpu_base, uint32 packed)
-{
-	powerpc_cpu *cpu = (powerpc_cpu *)cpu_base;
-	powerpc_vr &vD = cpu->vr(unpack_vr_index(packed, 0));
-	const int16 value = (int8)((packed >> 8) & 0xff);
-	for (int i = 0; i < 8; i++)
-		vD.h[i] = (uint16)value;
-}
-
-static void call_aarch64_vspltisw(dyngen_cpu_base cpu_base, uint32 packed)
-{
-	powerpc_cpu *cpu = (powerpc_cpu *)cpu_base;
-	powerpc_vr &vD = cpu->vr(unpack_vr_index(packed, 0));
-	const int32 value = (int8)((packed >> 8) & 0xff);
-	for (int i = 0; i < 4; i++)
-		vD.w[i] = (uint32)value;
-}
 #endif
 
 bool powerpc_jit::initialize(void)
@@ -522,83 +432,219 @@ bool powerpc_jit::gen_vector_generic_store_word(int mnemo, int vS, int rA, int r
 bool powerpc_jit::gen_aarch64_vperm(int mnemo, int vD, int vA, int vB, int vC)
 {
 	(void)mnemo;
-	typedef void (*func_t)(dyngen_cpu_base, uint32);
-	const uint32 packed = (vD & 31) | ((vA & 31) << 5) | ((vB & 31) << 10) | ((vC & 31) << 15);
-	func_t func = &call_aarch64_vperm;
-	gen_invoke_CPU_im(func, packed);
+	gen_load_ad_VD_VR(vD);
+	gen_load_ad_V0_VR(vA);
+	gen_load_ad_V1_VR(vB);
+	gen_load_ad_V2_VR(vC);
+	gen_op_neon_vperm();
 	return true;
 }
 
 bool powerpc_jit::gen_aarch64_vsldoi(int mnemo, int vD, int vA, int vB, int SH)
 {
 	(void)mnemo;
-	typedef void (*func_t)(dyngen_cpu_base, uint32);
-	const uint32 packed = (vD & 31) | ((vA & 31) << 5) | ((vB & 31) << 10) | ((SH & 0x0f) << 15);
-	func_t func = &call_aarch64_vsldoi;
-	gen_invoke_CPU_im(func, packed);
+	gen_load_ad_VD_VR(vD);
+	gen_load_ad_V0_VR(vA);
+	gen_load_ad_V1_VR(vB);
+	switch (SH & 0xf) {
+	case  0: gen_op_neon_vsldoi_0();  break;
+	case  1: gen_op_neon_vsldoi_1();  break;
+	case  2: gen_op_neon_vsldoi_2();  break;
+	case  3: gen_op_neon_vsldoi_3();  break;
+	case  4: gen_op_neon_vsldoi_4();  break;
+	case  5: gen_op_neon_vsldoi_5();  break;
+	case  6: gen_op_neon_vsldoi_6();  break;
+	case  7: gen_op_neon_vsldoi_7();  break;
+	case  8: gen_op_neon_vsldoi_8();  break;
+	case  9: gen_op_neon_vsldoi_9();  break;
+	case 10: gen_op_neon_vsldoi_10(); break;
+	case 11: gen_op_neon_vsldoi_11(); break;
+	case 12: gen_op_neon_vsldoi_12(); break;
+	case 13: gen_op_neon_vsldoi_13(); break;
+	case 14: gen_op_neon_vsldoi_14(); break;
+	case 15: gen_op_neon_vsldoi_15(); break;
+	}
 	return true;
 }
 
 bool powerpc_jit::gen_aarch64_vspltb(int mnemo, int vD, int UIMM, int vB)
 {
 	(void)mnemo;
-	typedef void (*func_t)(dyngen_cpu_base, uint32);
-	const uint32 packed = (vD & 31) | ((UIMM & 0x1f) << 5) | ((vB & 31) << 10);
-	func_t func = &call_aarch64_vspltb;
-	gen_invoke_CPU_im(func, packed);
+	gen_load_ad_VD_VR(vD);
+	gen_load_ad_V1_VR(vB);
+	switch (UIMM & 0xf) {
+	case  0: gen_op_neon_vspltb_0();  break;
+	case  1: gen_op_neon_vspltb_1();  break;
+	case  2: gen_op_neon_vspltb_2();  break;
+	case  3: gen_op_neon_vspltb_3();  break;
+	case  4: gen_op_neon_vspltb_4();  break;
+	case  5: gen_op_neon_vspltb_5();  break;
+	case  6: gen_op_neon_vspltb_6();  break;
+	case  7: gen_op_neon_vspltb_7();  break;
+	case  8: gen_op_neon_vspltb_8();  break;
+	case  9: gen_op_neon_vspltb_9();  break;
+	case 10: gen_op_neon_vspltb_10(); break;
+	case 11: gen_op_neon_vspltb_11(); break;
+	case 12: gen_op_neon_vspltb_12(); break;
+	case 13: gen_op_neon_vspltb_13(); break;
+	case 14: gen_op_neon_vspltb_14(); break;
+	case 15: gen_op_neon_vspltb_15(); break;
+	}
 	return true;
 }
 
 bool powerpc_jit::gen_aarch64_vsplth(int mnemo, int vD, int UIMM, int vB)
 {
 	(void)mnemo;
-	typedef void (*func_t)(dyngen_cpu_base, uint32);
-	const uint32 packed = (vD & 31) | ((UIMM & 0x1f) << 5) | ((vB & 31) << 10);
-	func_t func = &call_aarch64_vsplth;
-	gen_invoke_CPU_im(func, packed);
+	gen_load_ad_VD_VR(vD);
+	gen_load_ad_V1_VR(vB);
+	switch (UIMM & 0x7) {
+	case 0: gen_op_neon_vsplth_0(); break;
+	case 1: gen_op_neon_vsplth_1(); break;
+	case 2: gen_op_neon_vsplth_2(); break;
+	case 3: gen_op_neon_vsplth_3(); break;
+	case 4: gen_op_neon_vsplth_4(); break;
+	case 5: gen_op_neon_vsplth_5(); break;
+	case 6: gen_op_neon_vsplth_6(); break;
+	case 7: gen_op_neon_vsplth_7(); break;
+	}
 	return true;
 }
 
 bool powerpc_jit::gen_aarch64_vspltw(int mnemo, int vD, int UIMM, int vB)
 {
 	(void)mnemo;
-	typedef void (*func_t)(dyngen_cpu_base, uint32);
-	const uint32 packed = (vD & 31) | ((UIMM & 0x1f) << 5) | ((vB & 31) << 10);
-	func_t func = &call_aarch64_vspltw;
-	gen_invoke_CPU_im(func, packed);
+	gen_load_ad_VD_VR(vD);
+	gen_load_ad_V1_VR(vB);
+	switch (UIMM & 0x3) {
+	case 0: gen_op_neon_vspltw_0(); break;
+	case 1: gen_op_neon_vspltw_1(); break;
+	case 2: gen_op_neon_vspltw_2(); break;
+	case 3: gen_op_neon_vspltw_3(); break;
+	}
 	return true;
 }
 
 bool powerpc_jit::gen_aarch64_vspltisb(int mnemo, int vD, int SIMM, int unused)
 {
-	(void)mnemo;
-	(void)unused;
-	typedef void (*func_t)(dyngen_cpu_base, uint32);
-	const uint32 packed = (vD & 31) | ((uint32)(SIMM & 0xff) << 8);
-	func_t func = &call_aarch64_vspltisb;
-	gen_invoke_CPU_im(func, packed);
+	(void)mnemo; (void)unused;
+	gen_load_ad_VD_VR(vD);
+	switch ((int8)SIMM) {
+	case -16: gen_op_neon_vspltisb_n16(); break;
+	case -15: gen_op_neon_vspltisb_n15(); break;
+	case -14: gen_op_neon_vspltisb_n14(); break;
+	case -13: gen_op_neon_vspltisb_n13(); break;
+	case -12: gen_op_neon_vspltisb_n12(); break;
+	case -11: gen_op_neon_vspltisb_n11(); break;
+	case -10: gen_op_neon_vspltisb_n10(); break;
+	case  -9: gen_op_neon_vspltisb_n9();  break;
+	case  -8: gen_op_neon_vspltisb_n8();  break;
+	case  -7: gen_op_neon_vspltisb_n7();  break;
+	case  -6: gen_op_neon_vspltisb_n6();  break;
+	case  -5: gen_op_neon_vspltisb_n5();  break;
+	case  -4: gen_op_neon_vspltisb_n4();  break;
+	case  -3: gen_op_neon_vspltisb_n3();  break;
+	case  -2: gen_op_neon_vspltisb_n2();  break;
+	case  -1: gen_op_neon_vspltisb_n1();  break;
+	case   0: gen_op_neon_vspltisb_p0();  break;
+	case   1: gen_op_neon_vspltisb_p1();  break;
+	case   2: gen_op_neon_vspltisb_p2();  break;
+	case   3: gen_op_neon_vspltisb_p3();  break;
+	case   4: gen_op_neon_vspltisb_p4();  break;
+	case   5: gen_op_neon_vspltisb_p5();  break;
+	case   6: gen_op_neon_vspltisb_p6();  break;
+	case   7: gen_op_neon_vspltisb_p7();  break;
+	case   8: gen_op_neon_vspltisb_p8();  break;
+	case   9: gen_op_neon_vspltisb_p9();  break;
+	case  10: gen_op_neon_vspltisb_p10(); break;
+	case  11: gen_op_neon_vspltisb_p11(); break;
+	case  12: gen_op_neon_vspltisb_p12(); break;
+	case  13: gen_op_neon_vspltisb_p13(); break;
+	case  14: gen_op_neon_vspltisb_p14(); break;
+	case  15: gen_op_neon_vspltisb_p15(); break;
+	}
 	return true;
 }
 
 bool powerpc_jit::gen_aarch64_vspltish(int mnemo, int vD, int SIMM, int unused)
 {
-	(void)mnemo;
-	(void)unused;
-	typedef void (*func_t)(dyngen_cpu_base, uint32);
-	const uint32 packed = (vD & 31) | ((uint32)(SIMM & 0xff) << 8);
-	func_t func = &call_aarch64_vspltish;
-	gen_invoke_CPU_im(func, packed);
+	(void)mnemo; (void)unused;
+	gen_load_ad_VD_VR(vD);
+	switch ((int8)SIMM) {
+	case -16: gen_op_neon_vspltish_n16(); break;
+	case -15: gen_op_neon_vspltish_n15(); break;
+	case -14: gen_op_neon_vspltish_n14(); break;
+	case -13: gen_op_neon_vspltish_n13(); break;
+	case -12: gen_op_neon_vspltish_n12(); break;
+	case -11: gen_op_neon_vspltish_n11(); break;
+	case -10: gen_op_neon_vspltish_n10(); break;
+	case  -9: gen_op_neon_vspltish_n9();  break;
+	case  -8: gen_op_neon_vspltish_n8();  break;
+	case  -7: gen_op_neon_vspltish_n7();  break;
+	case  -6: gen_op_neon_vspltish_n6();  break;
+	case  -5: gen_op_neon_vspltish_n5();  break;
+	case  -4: gen_op_neon_vspltish_n4();  break;
+	case  -3: gen_op_neon_vspltish_n3();  break;
+	case  -2: gen_op_neon_vspltish_n2();  break;
+	case  -1: gen_op_neon_vspltish_n1();  break;
+	case   0: gen_op_neon_vspltish_p0();  break;
+	case   1: gen_op_neon_vspltish_p1();  break;
+	case   2: gen_op_neon_vspltish_p2();  break;
+	case   3: gen_op_neon_vspltish_p3();  break;
+	case   4: gen_op_neon_vspltish_p4();  break;
+	case   5: gen_op_neon_vspltish_p5();  break;
+	case   6: gen_op_neon_vspltish_p6();  break;
+	case   7: gen_op_neon_vspltish_p7();  break;
+	case   8: gen_op_neon_vspltish_p8();  break;
+	case   9: gen_op_neon_vspltish_p9();  break;
+	case  10: gen_op_neon_vspltish_p10(); break;
+	case  11: gen_op_neon_vspltish_p11(); break;
+	case  12: gen_op_neon_vspltish_p12(); break;
+	case  13: gen_op_neon_vspltish_p13(); break;
+	case  14: gen_op_neon_vspltish_p14(); break;
+	case  15: gen_op_neon_vspltish_p15(); break;
+	}
 	return true;
 }
 
 bool powerpc_jit::gen_aarch64_vspltisw(int mnemo, int vD, int SIMM, int unused)
 {
-	(void)mnemo;
-	(void)unused;
-	typedef void (*func_t)(dyngen_cpu_base, uint32);
-	const uint32 packed = (vD & 31) | ((uint32)(SIMM & 0xff) << 8);
-	func_t func = &call_aarch64_vspltisw;
-	gen_invoke_CPU_im(func, packed);
+	(void)mnemo; (void)unused;
+	gen_load_ad_VD_VR(vD);
+	switch ((int8)SIMM) {
+	case -16: gen_op_neon_vspltisw_n16(); break;
+	case -15: gen_op_neon_vspltisw_n15(); break;
+	case -14: gen_op_neon_vspltisw_n14(); break;
+	case -13: gen_op_neon_vspltisw_n13(); break;
+	case -12: gen_op_neon_vspltisw_n12(); break;
+	case -11: gen_op_neon_vspltisw_n11(); break;
+	case -10: gen_op_neon_vspltisw_n10(); break;
+	case  -9: gen_op_neon_vspltisw_n9();  break;
+	case  -8: gen_op_neon_vspltisw_n8();  break;
+	case  -7: gen_op_neon_vspltisw_n7();  break;
+	case  -6: gen_op_neon_vspltisw_n6();  break;
+	case  -5: gen_op_neon_vspltisw_n5();  break;
+	case  -4: gen_op_neon_vspltisw_n4();  break;
+	case  -3: gen_op_neon_vspltisw_n3();  break;
+	case  -2: gen_op_neon_vspltisw_n2();  break;
+	case  -1: gen_op_neon_vspltisw_n1();  break;
+	case   0: gen_op_neon_vspltisw_p0();  break;
+	case   1: gen_op_neon_vspltisw_p1();  break;
+	case   2: gen_op_neon_vspltisw_p2();  break;
+	case   3: gen_op_neon_vspltisw_p3();  break;
+	case   4: gen_op_neon_vspltisw_p4();  break;
+	case   5: gen_op_neon_vspltisw_p5();  break;
+	case   6: gen_op_neon_vspltisw_p6();  break;
+	case   7: gen_op_neon_vspltisw_p7();  break;
+	case   8: gen_op_neon_vspltisw_p8();  break;
+	case   9: gen_op_neon_vspltisw_p9();  break;
+	case  10: gen_op_neon_vspltisw_p10(); break;
+	case  11: gen_op_neon_vspltisw_p11(); break;
+	case  12: gen_op_neon_vspltisw_p12(); break;
+	case  13: gen_op_neon_vspltisw_p13(); break;
+	case  14: gen_op_neon_vspltisw_p14(); break;
+	case  15: gen_op_neon_vspltisw_p15(); break;
+	}
 	return true;
 }
 #endif
