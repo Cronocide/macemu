@@ -1218,13 +1218,11 @@ void sheepshaver_cpu::execute_native_op(uint32 selector)
 		uint32 saved_ctr = ctr();
 		uint32 saved_sp = gpr(1);
 		uint32 saved_r2 = gpr(2);
-		uint32 saved_pc = pc();
-
 		uint32 pre_subop = ReadMacInt32(rave_scratch_addr);
 
 		if (rave_logging_enabled && pre_subop >= 200 && pre_subop <= 207) {
 			printf("RAVE NATIVE_OP: subop=%d PC=0x%08x LR=0x%08x CTR=0x%08x SP=0x%08x R2=0x%08x\n",
-			       pre_subop, saved_pc, saved_lr, saved_ctr, saved_sp, saved_r2);
+			       pre_subop, pc(), saved_lr, saved_ctr, saved_sp, saved_r2);
 		}
 
 		// PPC ABI: float args travel in FPRs. SetFloat(ctx, tag, value)
@@ -1299,11 +1297,13 @@ void sheepshaver_cpu::execute_native_op(uint32 selector)
 		const GLFuncSignature& sig = gl_func_signatures[sub_opcode < GL_MAX_SUBOPCODE ? sub_opcode : 0];
 		uint32 float_bits[13] = {0};
 		int fpr_idx = 0;
-		for (int i = 0; i < sig.num_args && i < 8; i++) {
-			if (sig.float_mask & (1 << i)) {
-				float fval = (float)fpr(1 + fpr_idx);
-				memcpy(&float_bits[fpr_idx], &fval, 4);
-				fpr_idx++;
+		if (sig.float_mask) {
+			for (int i = 0; i < sig.num_args && i < 8; i++) {
+				if (sig.float_mask & (1 << i)) {
+					float fval = (float)fpr(1 + fpr_idx);
+					memcpy(&float_bits[fpr_idx], &fval, 4);
+					fpr_idx++;
+				}
 			}
 		}
 
