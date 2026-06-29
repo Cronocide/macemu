@@ -159,6 +159,11 @@ extern void video_clear_rave_display(void);
 // Register the RAVE draw context's position and size for video_clear_rave_display.
 extern void video_set_rave_display(unsigned int ctx_id, int x, int y, int w, int h);
 
+// Returns true (and clears the flag) if any guest 2D draw has written into the
+// RAVE display rect since the last call.  Used by NativeRenderEnd to decide
+// whether a CPU readback is needed for QuickDraw overlay compositing.
+extern bool video_rave_take_dirty_2d(void);
+
 // Push a CPU-side readback of a RAVE/GL FBO into the Mac framebuffer at the
 // given Mac coordinates.  Used by renderers that elected to do glReadPixels
 // (e.g. for QuickDraw z-order with overlapping menus) instead of relying on

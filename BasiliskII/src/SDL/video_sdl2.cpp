@@ -3528,9 +3528,26 @@ static int redraw_func(void *arg)
  *  Record dirty area from NQD
  */
 
+// RAVE 3D display state (declared here so video_set_dirty_area can reference them)
+#ifdef SHEEPSHAVER
+static uint32_t s_rave_display_id = 0;
+static int s_rave_x = 0, s_rave_y = 0, s_rave_w = 0, s_rave_h = 0;
+static bool s_rave_dirty_2d = false;      // guest 2D touched the RAVE rect this frame
+static bool s_suppress_rave_dirty_2d = false;  // suppress in emulator-internal blits
+#endif
+
 #ifdef SHEEPSHAVER
 void video_set_dirty_area(int x, int y, int w, int h)
 {
+	// Track whether any 2D write overlaps the active RAVE display rect so
+	// NativeRenderEnd can skip the glReadPixels readback on frames with no overlap.
+	// Suppress for emulator-internal blits (video_blit_rave_fbo / video_clear_rave_display)
+	// that are not guest QuickDraw writes.
+	if (!s_suppress_rave_dirty_2d && w > 0 && h > 0 && s_rave_w > 0 && s_rave_h > 0) {
+		if (x < s_rave_x + s_rave_w && x + w > s_rave_x &&
+		    y < s_rave_y + s_rave_h && y + h > s_rave_y)
+			s_rave_dirty_2d = true;
+	}
 #ifdef ENABLE_VOSF
 	const VIDEO_MODE &mode = drv->mode;
 	const unsigned screen_width = VIDEO_MODE_X;
@@ -3580,9 +3597,6 @@ void video_set_dirty_area(int x, int y, int w, int h)
  */
 
 #ifdef SHEEPSHAVER
-static uint32_t s_rave_display_id = 0;
-static int s_rave_x = 0, s_rave_y = 0, s_rave_w = 0, s_rave_h = 0;
-
 extern "C" void video_set_rave_display(unsigned int ctx_id, int x, int y, int w, int h)
 {
 	s_rave_display_id = ctx_id;
@@ -3646,8 +3660,18 @@ extern "C" void video_blit_rave_fbo(const uint8_t *rgba, int src_w, int src_h, i
 		return;
 	}
 
-	// Mark region dirty so the VOSF / periodic refresh picks it up
+	// Mark region dirty so the VOSF / periodic refresh picks it up, but do NOT
+	// set the RAVE 2D-overlay flag: this write is our own readback, not a QuickDraw draw.
+	s_suppress_rave_dirty_2d = true;
 	video_set_dirty_area(dst_x, dst_y, copy_w, copy_h);
+	s_suppress_rave_dirty_2d = false;
+}
+
+extern "C" bool video_rave_take_dirty_2d(void)
+{
+	bool was = s_rave_dirty_2d;
+	s_rave_dirty_2d = false;
+	return was;
 }
 
 extern "C" void video_clear_rave_display(void)
@@ -3667,7 +3691,9 @@ extern "C" void video_clear_rave_display(void)
 	for (int row = 0; row < h; row++)
 		memset(the_buffer + (size_t)(y + row) * row_bytes + x * 4, 0, (size_t)w * 4);
 
+	s_suppress_rave_dirty_2d = true;
 	video_set_dirty_area(x, y, w, h);
+	s_suppress_rave_dirty_2d = false;
 
 	// Clear compositor overlay slot
 	gles_compositor_clear_overlay(COMPOSITOR_OVERLAY_RAVE);

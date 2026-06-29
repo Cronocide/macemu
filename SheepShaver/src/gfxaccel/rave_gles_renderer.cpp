@@ -47,6 +47,8 @@ extern uint32 Mac_sysalloc(uint32 size);
 bool          rave_perf = false;					// shared with rave_dispatch.cpp
 int64         g_rave_dispatch_us = 0;				// time inside RaveDispatch this frame
 static bool   rave_perf_init = false;
+static bool   rave_readback_pref_init = false;
+static bool   rave_cpu_readback_pref  = false;  // if true, always readback; default: dirty-flag only
 static uint64 rave_perf_flush_us = 0;
 static uint64 rave_perf_readback_us = 0;
 static uint64 rave_perf_blit_us = 0;
@@ -1411,6 +1413,13 @@ int32_t NativeRenderEnd(uint32_t drawContextAddr, uint32_t modifiedRectAddr)
 		rave_perf = PrefsFindBool("perf_profile");
 		rave_perf_init = true;
 	}
+	if (!rave_readback_pref_init) {
+		rave_cpu_readback_pref = PrefsFindBool("rave_cpu_readback");
+		rave_readback_pref_init = true;
+	}
+	// Skip glReadPixels when no guest 2D write has touched the RAVE rect since
+	// last frame.  Force-enable via the "rave_cpu_readback" pref for debugging.
+	const bool do_readback = rave_cpu_readback_pref || video_rave_take_dirty_2d();
 	const uint64 rave_t0 = rave_perf ? GetTicks_usec() : 0;
 
 	FlushZSortBuffer(priv);
@@ -1471,11 +1480,13 @@ int32_t NativeRenderEnd(uint32_t drawContextAddr, uint32_t modifiedRectAddr)
 	}
 	// #endregion
 
-	// Read render FBO directly after glFinish().  The old presentFBO + blit
-	// path could show alternating stale/new frames on Mali (tile deferred).
+	// Read render FBO so QuickDraw UI drawn on top of 3D content sees correct
+	// pixels.  Skipped when no guest 2D write has touched the RAVE rect (the GPU
+	// compositor overlay handles on-screen 3D without a CPU readback).  Force
+	// readback every frame by setting the "rave_cpu_readback" pref to true.
 	uint8_t *readbackPtr = nullptr;
 	int readbackW = 0, readbackH = 0;
-	{
+	if (do_readback) {
 		glBindFramebuffer(GL_FRAMEBUFFER, gs->fbo);
 		int w = gs->fboWidth, h = gs->fboHeight;
 		uint32_t needed = (uint32_t)(w * h * 4);
