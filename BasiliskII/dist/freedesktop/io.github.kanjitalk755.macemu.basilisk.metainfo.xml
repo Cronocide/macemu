@@ -26,11 +26,11 @@
   </description>
   <screenshots>
     <screenshot type="default">
-      <image type="source">https://cdn.jsdelivr.net/gh/kanjitalk755/macemu@master/dist/screenshots/linux/setup.png</image>
+      <image type="source">https://cdn.jsdelivr.net/gh/kanjitalk755/macemu@master/BasiliskII/dist/screenshots/linux/setup.png</image>
       <caption>Basilisk II's main GUI, now ported to full Gtk3</caption>
     </screenshot>
     <screenshot>
-      <image type="source">https://cdn.jsdelivr.net/gh/kanjitalk755/macemu@master/dist/screenshots/linux/boot.png</image>
+      <image type="source">https://cdn.jsdelivr.net/gh/kanjitalk755/macemu@master/BasiliskII/dist/screenshots/linux/boot.png</image>
       <caption>MacOS 8.1 booting in Basilisk II</caption>
     </screenshot>
   </screenshots>
