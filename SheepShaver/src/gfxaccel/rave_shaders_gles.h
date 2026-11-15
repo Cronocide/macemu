@@ -172,8 +172,11 @@ static const char *rave_fragment_src =
 	"        fog_factor = clamp(exp(-u_fog_density * z), 0.0, 1.0);\n"
 	"    } else if (u_fog_mode == 4) {\n"
 	"        float z = (v_texcoord.z > 0.0) ? (1.0 / v_texcoord.z) : (gl_FragCoord.z * u_fog_max_depth);\n"
-	"        float dz = u_fog_density * z;\n"
-	"        fog_factor = clamp(exp(-dz * dz), 0.0, 1.0);\n"
+	// QD3D's interactive renderer (Bugdom menus/intros) sends mode 4 with
+	// start/end as fractions of yon and density = yon (e.g. 0.8/1.0/1000).
+	// A literal exp2 with that density is 0 at any depth -> solid fog colour.
+	// Use the start/end ramp, which is what those parameters describe.
+	"        fog_factor = clamp((u_fog_end - z) / (u_fog_end - u_fog_start), 0.0, 1.0);\n"
 	"    }\n"
 	"    color.rgb = mix(u_fog_color.rgb, color.rgb, fog_factor);\n"
 	"    if (u_fog_mode == 1) {\n"
