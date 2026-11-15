@@ -97,7 +97,7 @@ extern uintptr SignalStackBase();
 extern "C" void check_load_invoc(uint32 type, int16 id, uint32 h);
 extern "C" void named_check_load_invoc(uint32 type, uint32 name, uint32 h);
 
-// PowerPC EmulOp to exit from emulation looop
+// PowerPC EmulOp to exit from emulation loop
 const uint32 POWERPC_EXEC_RETURN = POWERPC_EMUL_OP | 1;
 
 // Enable Execute68k() safety checks?
@@ -868,7 +868,14 @@ sigsegv_return_t sigsegv_handler(sigsegv_info_t *sip)
 	dump_disassembly(pc, 8, 8);
 
 	enter_mon();
+#if HAVE_MACH_EXCEPTIONS
+	// The faulting thread is suspended while this exception-server thread runs.
+	// QuitEmulator() would destroy SDL/AppKit windows off the main thread;
+	// dispatching shutdown to the suspended thread would deadlock instead.
+	// Let the Mach backend forward the original exception.
+#else
 	QuitEmulator();
+#endif
 
 	return SIGSEGV_RETURN_FAILURE;
 }

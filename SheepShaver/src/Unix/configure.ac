@@ -421,8 +421,8 @@ AC_SYS_LARGEFILE
 dnl Checks for header files.
 AC_HEADER_STDC
 AC_HEADER_SYS_WAIT
-AC_CHECK_HEADERS(malloc.h stdint.h)
-AC_CHECK_HEADERS(mach/vm_map.h mach/mach_init.h sys/mman.h)
+AC_CHECK_HEADERS(malloc.h stdint.h sys/types.h)
+AC_CHECK_HEADERS(mach/vm_map.h mach/mach_init.h sys/mman.h linux/sched.h)
 AC_CHECK_HEADERS(unistd.h fcntl.h byteswap.h dirent.h)
 AC_CHECK_HEADERS(sys/socket.h sys/ioctl.h sys/filio.h sys/bitypes.h sys/wait.h)
 AC_CHECK_HEADERS(sys/time.h sys/poll.h sys/select.h arpa/inet.h)
@@ -747,6 +747,11 @@ AS_IF([test  "x$have_libvhd" = "xyes" ], [
 ])
 
 
+AC_ARG_WITH(vdeplug,
+AS_HELP_STRING([--with-vdeplug], [Enable VDE virtual network support]),
+[],
+[with_vdeplug=yes])
+
 
 
 dnl Is the slirp library supported?
@@ -768,9 +773,16 @@ if [[ -n "$CAN_SLIRP" ]]; then
 fi
 AC_SUBST(SLIRP_SRCS)
 
+dnl Is libvdeplug available?
+have_vdeplug=no
+AS_IF([test "x$with_vdeplug" = "xyes"], [
+have_vdeplug=yes
+AC_CHECK_LIB(vdeplug, vde_close, [], [have_vdeplug=no])
+])
+
 dnl SDL overrides
 if [[ "x$WANT_SDL" = "xyes" ]]; then
-  AC_DEFINE(USE_SDL, 1, [Define to enble SDL support.])
+  AC_DEFINE(USE_SDL, 1, [Define to enable SDL support.])
 fi
 if [[ "x$WANT_SDL_VIDEO" = "xyes" ]]; then
   AC_DEFINE(USE_SDL_VIDEO, 1, [Define to enable SDL video graphics support.])
@@ -1010,7 +1022,7 @@ AC_CACHE_CHECK([whether __PAGEZERO can be Low Memory area 0x0000-0x3000],
   ac_cv_pagezero_hack, [
   ac_cv_pagezero_hack=no 
   case $target_os:$target_cpu in
-  darwin*:x86_64)
+  darwin*:powerpc | darwin*:x86_64)
     ac_cv_pagezero_hack=yes
     ;;
   esac
@@ -1481,7 +1493,11 @@ gcc_AC_C_FLOAT_FORMAT
 dnl Platform specific binary postprocessor
 AC_PATH_PROG(BLESS, "true")
 if [[ "x$ac_cv_pagezero_hack" = "xyes" ]]; then
-#  BLESS=Darwin/lowmem
+  case $target_os:$target_cpu in
+  darwin*:powerpc)
+    BLESS=Darwin/lowmem
+    ;;
+  esac
   LDFLAGS="$LDFLAGS -pagezero_size 0x3000"
 fi
 
@@ -1761,7 +1777,7 @@ if [[ -n "$LINKER_SCRIPT_FLAGS" ]]; then
     saved_LDFLAGS="$LDFLAGS"
     LDFLAGS="$LDFLAGS $LINKER_SCRIPT_FLAGS"
     AC_TRY_RUN(
-      [int main() {if ((char *)&main < (char *)0x70000000) return 1;}],
+      [int main() {if ((char *)(&main) < (char *)0x70000000) return 1;}],
       [ac_cv_linker_script_works=yes],
       [ac_cv_linker_script_works=no],
       dnl When cross-compiling, assume it works
@@ -1803,6 +1819,7 @@ echo SDL support ...................... : $SDL_SUPPORT
 echo SDL major-version ................ : $WANT_SDL_VERSION_MAJOR
 echo BINCUE support ................... : $have_bincue
 echo LIBVHD support ................... : $have_libvhd
+echo VDE support ...................... : $have_vdeplug
 echo FBDev DGA support ................ : $WANT_FBDEV_DGA
 echo XFree86 DGA support .............. : $WANT_XF86_DGA
 echo XFree86 VidMode support .......... : $WANT_XF86_VIDMODE

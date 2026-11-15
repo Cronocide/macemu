@@ -30,7 +30,7 @@
  *    - There is a pointer to Thread Local Storage (TLS) under Linux with
  *      recent enough glibc. This is r2 in 32-bit mode and r13 in
  *      64-bit mode (PowerOpen/AIX ABI)
- *    - r13 is used as a small data pointer under Linux (but appearently
+ *    - r13 is used as a small data pointer under Linux (but apparently
  *      it is not used this way? To be sure, we specify -msdata=none
  *      in the Makefile)
  *    - There are no TVECTs under Linux; function pointers point
@@ -209,6 +209,8 @@ int64 TimebaseSpeed;	// Timebase clock speed (Hz)
 uint8 *RAMBaseHost;		// Base address of Mac RAM (host address space)
 uint8 *ROMBaseHost;		// Base address of Mac ROM (host address space)
 uint32 ROMEnd;
+// vde switch variable
+char* vde_sock;
 
 #if defined(__APPLE__) && defined(__x86_64__) || defined(MEM_BULK)
 uint8 gZeroPage[0x3000], gKernelData[0x2000];
@@ -733,10 +735,11 @@ static bool init_sdl()
 	assert(sdl_flags != 0);
 
 #ifdef USE_SDL_VIDEO
-#if REAL_ADDRESSING && defined(GDK_WINDOWING_WAYLAND) && !defined(__aarch64__)
-	// Needed to fix a crash when using Wayland
-	// Forces use of XWayland instead
-	setenv("SDL_VIDEODRIVER", "x11", true);
+#if REAL_ADDRESSING && defined(__linux__) && !defined(__aarch64__)
+	// Wayland's mmap usage conflicts with fixed low-address mappings; force XWayland.
+	// (Not on AArch64: the H700 target has no X11, SDL must use its native KMS/DRM driver.)
+	if (getenv("WAYLAND_DISPLAY") && !getenv("SDL_VIDEODRIVER"))
+		setenv("SDL_VIDEODRIVER", "x11", 0);
 #endif
 
 	// Don't let SDL block the screensaver
@@ -946,7 +949,8 @@ int main(int argc, char **argv)
 	if (use_gui == -1)
 		use_gui = !PrefsFindBool("nogui");
 
-#if SDL_PLATFORM_MACOS && SDL_VERSION_ATLEAST(2,0,0)
+#if SDL_PLATFORM_MACOS
+#if SDL_VERSION_ATLEAST(2,0,0)
 	// On Mac OS X hosts, SDL2 will create its own menu bar.  This is mostly OK,
 	// except that it will also install keyboard shortcuts, such as Command + Q,
 	// which can interfere with keyboard shortcuts in the guest OS.
@@ -954,6 +958,7 @@ int main(int argc, char **argv)
 	// HACK: disable these shortcuts, while leaving all other pieces of SDL2's
 	// menu bar in-place.
 	disable_SDL2_macosx_menu_bar_keyboard_shortcuts();
+#endif
 #endif
 	
 	// Any command line arguments left?
@@ -1674,10 +1679,9 @@ static void *tick_func(void *arg)
 
 			// Yes, dump registers
 			sigregs *r = &sigsegv_regs;
-			char str[256];
 			if (crash_reason == NULL)
 				crash_reason = "SIGSEGV";
-			sprintf(str, "%s\n"
+			printf("%s\n"
 				"   pc %08lx     lr %08lx    ctr %08lx    msr %08lx\n"
 				"  xer %08lx     cr %08lx  \n"
 				"   r0 %08lx     r1 %08lx     r2 %08lx     r3 %08lx\n"
@@ -1699,7 +1703,6 @@ static void *tick_func(void *arg)
 				r->gpr[20], r->gpr[21], r->gpr[22], r->gpr[23],
 				r->gpr[24], r->gpr[25], r->gpr[26], r->gpr[27],
 				r->gpr[28], r->gpr[29], r->gpr[30], r->gpr[31]);
-			printf(str);
 			VideoQuitFullScreen();
 
 #ifdef ENABLE_MON
@@ -1908,6 +1911,7 @@ void EnableInterrupt(void)
  */
 
 #if !EMULATED_PPC
+__attribute__((no_stack_protector))
 void sigusr2_handler(int sig, siginfo_t *sip, void *scp)
 {
 	machine_regs *r = MACHINE_REGISTERS(scp);
@@ -1937,8 +1941,8 @@ void sigusr2_handler(int sig, siginfo_t *sip, void *scp)
 	switch (ReadMacInt32(XLM_RUN_MODE)) {
 		case MODE_68K:
 			// 68k emulator active, trigger 68k interrupt level 1
-			WriteMacInt16(ReadMacInt32(0x67c), 1);
-			r->cr() |= ReadMacInt32(0x674);
+			WriteMacInt16(ReadMacInt32(KERNEL_DATA_BASE + 0x67c), 1);
+			r->cr() |= ReadMacInt32(KERNEL_DATA_BASE + 0x674);
 			break;
 
 #if INTERRUPTS_IN_NATIVE_MODE
@@ -1950,8 +1954,10 @@ void sigusr2_handler(int sig, siginfo_t *sip, void *scp)
 				sigaltstack(&extra_stack, NULL);
 				
 				// Prepare for 68k interrupt level 1
-				WriteMacInt16(ReadMacInt32(0x67c), 1);
-				WriteMacInt32(ReadMacInt32(0x658) + 0xdc, ReadMacInt32(ReadMacInt32(0x658) + 0xdc) | ReadMacInt32(0x674));
+				WriteMacInt16(ReadMacInt32(KERNEL_DATA_BASE + 0x67c), 1);
+				WriteMacInt32(ReadMacInt32(KERNEL_DATA_BASE + 0x658) + 0xdc,
+								ReadMacInt32(ReadMacInt32(KERNEL_DATA_BASE + 0x658) + 0xdc)
+								| ReadMacInt32(KERNEL_DATA_BASE + 0x674));
 
 				// Execute nanokernel interrupt routine (this will activate the 68k emulator)
 				DisableInterrupt();
@@ -2013,6 +2019,7 @@ void sigusr2_handler(int sig, siginfo_t *sip, void *scp)
  */
 
 #if !EMULATED_PPC
+__attribute__((no_stack_protector))
 static void sigsegv_handler(int sig, siginfo_t *sip, void *scp)
 {
 	machine_regs *r = MACHINE_REGISTERS(scp);
@@ -2235,7 +2242,7 @@ static void sigsegv_handler(int sig, siginfo_t *sip, void *scp)
 	// For all other errors, jump into debugger (sort of...)
 	crash_reason = (sig == SIGBUS) ? "SIGBUS" : "SIGSEGV";
 	if (!ready_for_signals) {
-		printf("%s\n");
+		printf("%s\n", crash_reason);
 		printf(" sigcontext %p, machine_regs %p\n", scp, r);
 		printf(
 			"   pc %08lx     lr %08lx    ctr %08lx    msr %08lx\n"
@@ -2248,7 +2255,6 @@ static void sigsegv_handler(int sig, siginfo_t *sip, void *scp)
 			"  r20 %08lx    r21 %08lx    r22 %08lx    r23 %08lx\n"
 			"  r24 %08lx    r25 %08lx    r26 %08lx    r27 %08lx\n"
 			"  r28 %08lx    r29 %08lx    r30 %08lx    r31 %08lx\n",
-			crash_reason,
 			r->pc(), r->lr(), r->ctr(), r->msr(),
 			r->xer(), r->cr(),
 			r->gpr(0), r->gpr(1), r->gpr(2), r->gpr(3),
@@ -2275,7 +2281,7 @@ rti:;
 /*
  *  SIGILL handler
  */
-
+__attribute__((no_stack_protector))
 static void sigill_handler(int sig, siginfo_t *sip, void *scp)
 {
 	machine_regs *r = MACHINE_REGISTERS(scp);
@@ -2410,7 +2416,7 @@ power_inst:		sprintf(str, GetString(STR_POWER_INSTRUCTION_ERR), r->pc(), r->gpr(
 	// For all other errors, jump into debugger (sort of...)
 	crash_reason = "SIGILL";
 	if (!ready_for_signals) {
-		printf("%s\n");
+		printf("%s\n", crash_reason);
 		printf(" sigcontext %p, machine_regs %p\n", scp, r);
 		printf(
 			"   pc %08lx     lr %08lx    ctr %08lx    msr %08lx\n"
@@ -2423,7 +2429,6 @@ power_inst:		sprintf(str, GetString(STR_POWER_INSTRUCTION_ERR), r->pc(), r->gpr(
 			"  r20 %08lx    r21 %08lx    r22 %08lx    r23 %08lx\n"
 			"  r24 %08lx    r25 %08lx    r26 %08lx    r27 %08lx\n"
 			"  r28 %08lx    r29 %08lx    r30 %08lx    r31 %08lx\n",
-			crash_reason,
 			r->pc(), r->lr(), r->ctr(), r->msr(),
 			r->xer(), r->cr(),
 			r->gpr(0), r->gpr(1), r->gpr(2), r->gpr(3),

@@ -141,7 +141,7 @@ struct op_carry {
 template<>
 struct op_carry<op_add> {
 	static inline bool apply(uint32 a, uint32 b, uint32 c) {
-		// TODO: use 32-bit arithmetics
+		// TODO: use 32-bit arithmetic
 		uint64 carry = (uint64)a + (uint64)b + (uint64)c;
 		return (carry >> 32) != 0;
 	}
@@ -164,14 +164,14 @@ struct op_overflow<op_neg> {
 template<>
 struct op_overflow<op_add> {
 	static inline bool apply(uint32 a, uint32 b, uint32 c) {
-		// TODO: use 32-bit arithmetics
+		// TODO: use 32-bit arithmetic
 		int64 overflow = (int64)(int32)a + (int64)(int32)b + (int64)(int32)c;
 		return (((uint64)overflow) >> 63) ^ (((uint32)overflow) >> 31);
 	}
 };
 
 /**
- *	Perform an addition/substraction
+ *	Perform an addition/subtraction
  *
  *		RA		Input operand register, possibly 0
  *		RB		Input operand either register or immediate
@@ -503,7 +503,7 @@ void powerpc_cpu::record_fpscr(int exceptions)
 }
 
 /**
- *	Floating-point arithmetics
+ *	Floating-point arithmetic
  *
  *		FP		Floating Point type
  *		OP		Operation to perform
@@ -680,6 +680,13 @@ PPC_HOT void powerpc_cpu::execute_fp_loadstore(uint32 opcode)
 	if (UP)
 		RA::set(this, opcode, ea);
 
+	increment_pc(4);
+}
+
+void powerpc_cpu::execute_stfiwx(uint32 opcode)
+{
+	const uint32 ea = operand_RA_or_0::get(this, opcode) + operand_RB::get(this, opcode);
+	vm_write_memory_4(ea, (uint32)operand_fp_dw_RS::get(this, opcode));
 	increment_pc(4);
 }
 

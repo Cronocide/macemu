@@ -322,4 +322,8 @@ static inline uae_u32 do_byteswap_16_g(uae_u32 v)
 #define ATTRIBUTE_PACKED __attribute__((__packed__))
 #endif
 
+// High-precision timing
+#define PRECISE_TIMING 1
+#define PRECISE_TIMING_WINDOWS 1
+
 #endif
