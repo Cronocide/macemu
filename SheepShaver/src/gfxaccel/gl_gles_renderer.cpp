@@ -375,6 +375,7 @@ struct GLGLESState {
 
 	GLint loc_mat_ambient, loc_mat_diffuse, loc_mat_specular, loc_mat_emission, loc_mat_shininess;
 	GLint loc_global_ambient;
+	GLint loc_shade_model;
 };
 
 static SavedGLState s_glPassSaved;
@@ -730,6 +731,7 @@ static bool CacheUniformLocations(GLGLESState *gs)
 	gs->loc_mat_emission = glGetUniformLocation(p, "u_mat_emission");
 	gs->loc_mat_shininess = glGetUniformLocation(p, "u_mat_shininess");
 	gs->loc_global_ambient = glGetUniformLocation(p, "u_global_ambient");
+	gs->loc_shade_model = glGetUniformLocation(p, "u_shade_model");
 
 	char buf[64];
 	for (int i = 0; i < 8; i++) {
@@ -879,6 +881,7 @@ static void UploadUniforms(GLContext *ctx, GLGLESState *gs)
 	glUniform4fv(gs->loc_mat_emission, 1, M.emission);
 	glUniform1f(gs->loc_mat_shininess, M.shininess);
 	glUniform4fv(gs->loc_global_ambient, 1, ctx->light_model_ambient);
+	glUniform1i(gs->loc_shade_model, (ctx->shade_model == GL_FLAT) ? 1 : 0);
 }
 
 static void ApplyFixedFunctionGLState(GLContext *ctx)
@@ -1141,6 +1144,7 @@ static void DrawTexturedNDCQuad(GLContext *ctx, GLGLESState *gs,
 	glUniform1i(gs->loc_alpha_func, 0);
 	glUniform1f(gs->loc_alpha_ref, 0);
 	glUniform1i(gs->loc_has_texture, 1);
+	glUniform1i(gs->loc_shade_model, 0);
 
 	for (int i = 0; i < 8; i++) {
 		GLGLESState::LightLocs &loc = gs->light_locs[i];
