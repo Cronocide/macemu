@@ -426,4 +426,8 @@ typedef int64 loff_t;
 #endif
 #define ATTRIBUTE_PACKED __attribute__((__packed__))
 
+// High-precision timing
+#define PRECISE_TIMING 1
+#define PRECISE_TIMING_WINDOWS 1
+
 #endif
