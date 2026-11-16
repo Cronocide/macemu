@@ -37,10 +37,18 @@
 extern HANDLE emul_thread;
 
 // Global variables
-static uint32 frequency;				// CPU frequency in Hz (< 4 GHz)
-static tm_time_t mac_boot_ticks;
-static tm_time_t mac_1904_ticks;
-static tm_time_t mac_now_diff;
+static uint64 cpufrequency;
+static const uint64 frequency = 10000000; // 100 ns timer ticks
+
+static tm_time_t count_to_ticks(uint64 count)
+{
+	uint64 seconds = count / cpufrequency;
+	uint64 remainder = count % cpufrequency;
+	return (tm_time_t)(seconds * frequency +
+		(remainder * frequency) / cpufrequency);
+}
+static tm_time_t qpc_start_ticks;
+static tm_time_t qpc_to_unix_ticks;
 
 
 /*
@@ -56,16 +64,15 @@ void timer_init(void)
 		ErrorAlert("No high resolution timers available\n");
 		QuitEmulator();
 	}
-	frequency = tt.LowPart;
+	cpufrequency = (uint64)tt.QuadPart;
 	D(bug(" frequency %d\n", frequency));
 
-	// mac_boot_ticks is 1.18 us since Basilisk II was started
+	// qpc_start_ticks is the 100 ns QPC tick count when Basilisk II starts.
 	QueryPerformanceCounter(&tt);
-	mac_boot_ticks = tt.QuadPart;
+	qpc_start_ticks = count_to_ticks((uint64)tt.QuadPart);
 
-	// mac_1904_ticks is 1.18 us since Mac time started 1904
-	mac_1904_ticks = time(NULL) * frequency;
-	mac_now_diff = mac_1904_ticks - mac_boot_ticks;
+	// Convert QPC ticks to the Unix epoch used by timer_unix.cpp.
+	qpc_to_unix_ticks = (tm_time_t)time(NULL) * frequency - qpc_start_ticks;
 }
 
 
@@ -78,9 +85,9 @@ void Microseconds(uint32 &hi, uint32 &lo)
 	D(bug("Microseconds\n"));
 	LARGE_INTEGER tt;
 	QueryPerformanceCounter(&tt);
-	tt.QuadPart = TICKS2USECS(tt.QuadPart - mac_boot_ticks);
-	hi = tt.HighPart;
-	lo = tt.LowPart;
+	uint64 elapsed = TICKS2USECS(count_to_ticks((uint64)tt.QuadPart) - qpc_start_ticks);
+	hi = (uint32)(elapsed >> 32);
+	lo = (uint32)elapsed;
 }
 
 
@@ -102,7 +109,7 @@ void timer_current_time(tm_time_t &t)
 {
 	LARGE_INTEGER tt;
 	QueryPerformanceCounter(&tt);
-	t = tt.QuadPart + mac_now_diff;
+	t = count_to_ticks((uint64)tt.QuadPart) + qpc_to_unix_ticks;
 }
 
 
@@ -181,7 +188,7 @@ uint64 GetTicks_usec(void)
 {
 	LARGE_INTEGER tt;
 	QueryPerformanceCounter(&tt);
-	return TICKS2USECS(tt.QuadPart - mac_boot_ticks);
+	return TICKS2USECS(count_to_ticks((uint64)tt.QuadPart) - qpc_start_ticks);
 }
 
 
@@ -191,9 +198,17 @@ uint64 GetTicks_usec(void)
 
 void Delay_usec(uint32 usec)
 {
-	// FIXME: fortunately, Delay_usec() is generally used with
-	// millisecond resolution anyway
-	Sleep(usec / 1000);
+	const uint64 deadline = GetTicks_usec() + usec;
+
+	for (;;) {
+		uint64 now = GetTicks_usec();
+		if (now >= deadline)
+			return;
+
+		uint64 remaining = deadline - now;
+		if (remaining >= 2000)
+			Sleep((DWORD)((remaining - 1000) / 1000));
+	}
 }
 
 
@@ -217,7 +232,7 @@ static HANDLE idle_lock = NULL;
 idle_sentinel::idle_sentinel()
 {
 	idle_sem_ok = 1;
-	if ((idle_sem = CreateSemaphore(0, 0, 1, NULL)) == NULL)
+	if ((idle_sem = CreateSemaphore(NULL, 0, 1, NULL)) == NULL)
 		idle_sem_ok = 0;
 	if ((idle_lock = CreateMutex(NULL, FALSE, NULL)) == NULL)
 		idle_sem_ok = 0;
@@ -225,14 +240,10 @@ idle_sentinel::idle_sentinel()
 
 idle_sentinel::~idle_sentinel()
 {
-	if (idle_lock) {
-		ReleaseMutex(idle_lock);
+	if (idle_lock != NULL)
 		CloseHandle(idle_lock);
-	}
-	if (idle_sem) {
-		ReleaseSemaphore(idle_sem, 1, NULL);
+	if (idle_sem != NULL)
 		CloseHandle(idle_sem);
-	}
 }
 
 void idle_wait(void)

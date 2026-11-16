@@ -890,7 +890,7 @@ fi
 
 dnl SDL overrides
 if [[ "x$WANT_SDL" = "xyes" ]]; then
-  AC_DEFINE(USE_SDL, 1, [Define to enble SDL support])
+  AC_DEFINE(USE_SDL, 1, [Define to enable SDL support])
   if [[ "x$WANT_SDL_FRAMEWORK" = "xyes" ]]; then
     EXTRASYSSRCS="$EXTRASYSSRCS ../SDL/SDLMain.m"
   fi
@@ -1438,7 +1438,7 @@ if [[ -n "$LINKER_SCRIPT_FLAGS" ]]; then
     saved_LDFLAGS="$LDFLAGS"
     LDFLAGS="$LDFLAGS $LINKER_SCRIPT_FLAGS"
     AC_TRY_RUN(
-      [int main() {if ((char *)&main < (char *)0x70000000) return 1;}],
+      [int main() {if ((char *)(&main) < (char *)0x70000000) return 1;}],
       [ac_cv_linker_script_works=yes],
       [ac_cv_linker_script_works=no],
       dnl When cross-compiling, assume it works
@@ -1508,8 +1508,10 @@ fi
 
 if [[ "x$OS_TYPE" = "xdarwin" ]]; then
   WANT_VOSF=no
-  if [[ "$target_cpu" != "arm" ]]; then
+  if [[ "$target_cpu" = "x86_64" ]]; then
     LDFLAGS="$LDFLAGS -Wl,-no_pie -pagezero_size 0x1000"
+  elif [[ "$target_cpu" = "powerpc" ]]; then
+    LDFLAGS="$LDFLAGS -pagezero_size 0x1000"
   fi
 fi
 

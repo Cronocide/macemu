@@ -271,6 +271,7 @@ struct RaveShaderProgram {
 	GLint loc_multi_texture_op;
 	GLint loc_multi_texture_factor;
 	GLint loc_env_color;
+	GLint loc_shade_model;
 };
 
 #define RAVE_NUM_SHADER_VARIANTS 16
@@ -447,6 +448,7 @@ static void BuildShaderVariant(RaveShaderProgram *out, int bits)
 	out->loc_multi_texture_op  = glGetUniformLocation(out->program, "u_multi_texture_op");
 	out->loc_multi_texture_factor = glGetUniformLocation(out->program, "u_multi_texture_factor");
 	out->loc_env_color         = glGetUniformLocation(out->program, "u_env_color");
+	out->loc_shade_model       = glGetUniformLocation(out->program, "u_shade_model");
 }
 
 

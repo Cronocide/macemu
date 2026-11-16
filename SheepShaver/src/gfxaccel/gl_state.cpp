@@ -1096,6 +1096,7 @@ void NativeGLClear(GLContext *ctx, uint32_t mask)
 void NativeGLShadeModel(GLContext *ctx, uint32_t mode)
 {
 	ctx->shade_model = mode;
+	ctx->uniform_dirty |= GL_UDIRTY_MISC;
 }
 
 void NativeGLCullFace(GLContext *ctx, uint32_t mode)
